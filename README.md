@@ -119,3 +119,81 @@ Automatycznie w chmurze (**GitHub Actions**):
 ```bash
 .venv/bin/pytest
 ```
+## Interfejs użytkownika
+
+### Ekran główny
+
+<p align="center">
+  <img src="screenshots/main.png" width="48%" alt="NFCplus Main Window">
+</p>
+
+---
+
+### Mifare Classic
+
+<p align="center">
+  <img src="screenshots/tab_mifare_1.png" width="48%" alt="Mifare Classic">
+</p>
+
+Import kluczy, odczyt, zapis, analiza Access Bits, Value Blocks oraz formatowanie kart.
+
+---
+
+### NTAG / Ultralight
+
+<p align="center">
+  <img src="screenshots/tab_ntag.png" width="48%" alt="NTAG Ultralight">
+</p>
+
+Get Version, PWD_AUTH, odczyt i zapis stron, NDEF URI/Text.
+
+---
+
+### Zrzuty (.dump)
+
+<p align="center">
+  <img src="screenshots/tab_dump_viewer.png" width="48%" alt="Dump Viewer">
+  
+</p>
+
+Przeglądanie oraz porównywanie zrzutów kart.
+
+---
+
+### 125 kHz / HID Prox
+
+<p align="center">
+  <img src="screenshots/tab_lf.png" width="48%" alt="125kHz HID">
+</p>
+
+Obsługa EM4100, HID Prox, T5577 i konwerter identyfikatorów.
+
+---
+
+### CPU / APDU
+
+<p align="center">
+  <img src="screenshots/tab_apdu.png" width="48%" alt="APDU Terminal">
+</p>
+
+Terminal APDU z dekodowaniem HEX / ASCII oraz SW1 SW2.
+
+---
+
+### Audyt Bezpieczeństwa
+
+<p align="center">
+  <img src="screenshots/tab_audit_1.png" width="48%" alt="Audit">
+</p>
+
+Nieinwazyjny audyt kart RFID/NFC z eksportem HTML, Markdown i JSON.
+
+---
+
+### Motyw jasny
+
+<p align="center">
+  <img src="screenshots/theme_light.png" width="48%" alt="Light Theme">
+</p>
+
+Przełączanie motywu w czasie rzeczywistym z zapisem ustawień użytkownika.
