@@ -1,0 +1,5 @@
+customtkinter>=5.2
+pytest>=8.0
+# Opcjonalnie (domyślnie działa wbudowany backend /dev/hidraw* na Linuksie i Win32 HID na Windowsie):
+# hidapi>=0.14.0
+# pyinstaller>=6.0

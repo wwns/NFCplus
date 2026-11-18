@@ -1,0 +1,14 @@
+# Reguły udev dla czytników wCopy / Xixei / NFC Pro (USB HID)
+# Instalacja na Linuksie:
+#   sudo cp udev/99-nfcplus.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="b030", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="b031", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2518", ATTRS{idProduct}=="6022", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2518", ATTRS{idProduct}=="6018", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="b030", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="b031", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2518", ATTRS{idProduct}=="6022", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2518", ATTRS{idProduct}=="6018", MODE="0660", GROUP="plugdev", TAG+="uaccess"

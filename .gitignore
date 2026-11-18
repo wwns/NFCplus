@@ -1,0 +1,22 @@
+# Środowisko wirtualne i cache Pythona
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Artefakty budowania PyInstaller / setuptools
+build/
+dist/
+*.spec
+*.egg-info/
+src/*.egg-info/
+
+# Oryginalna binarka referencyjna i lokalne zrzuty kart
+nfcPro_x64.exe
+*.dump
+*.bin
+*.mfd
