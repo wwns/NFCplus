@@ -218,3 +218,23 @@ def test_mifare_text_block_encoding_decoding_and_write_text() -> None:
     # Przekroczenie pojemności dostępnych bloków danych
     with pytest.raises(ValueError, match="przekracza pojemność"):
         encode_text_to_blocks("X" * 800, 64, start_block=1)
+
+
+def test_mifare_empty_factory_trailers_and_printable_check() -> None:
+    from nfcplus.dump import is_mostly_printable_text
+
+    d1k = MifareDump.empty(sectors=16)
+    assert d1k.total_blocks == 64
+    assert d1k.sector_count == 16
+    assert d1k.get_block(0) == b"\x00" * 16
+    assert d1k.get_block(3) == FACTORY_MIFARE_TRAILER
+    assert d1k.get_block(63) == FACTORY_MIFARE_TRAILER
+
+    d_default = MifareDump.empty()
+    assert d_default.total_blocks == 64
+    assert d_default.get_block(3) == FACTORY_MIFARE_TRAILER
+
+    assert is_mostly_printable_text(b"\x00" * 16) is False
+    assert is_mostly_printable_text(b"Witaj NFCplus!\x00\x00") is True
+    assert is_mostly_printable_text(b"\xff\xfe\xfd\x80\x81") is False
+    assert is_mostly_printable_text("Zażółć gęślą jaźń") is True

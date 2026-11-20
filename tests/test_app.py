@@ -15,12 +15,15 @@ from nfcplus.app import (
     SECTOR_COLOR_UNKNOWN_DARK,
     NFCPlusApp,
     _find_asset_path,
+    block_hex_to_utf8_text,
     format_apdu_exchange_entry,
     format_audit_status_banner,
     format_em4100_conversion_text,
     format_mifare_analysis,
     format_mifare_dump_text,
+    format_mifare_text_block_preview,
     format_mifare_text_capacity,
+    utf8_text_to_block_hex,
     format_ndef_records_text,
     format_write_report_summary,
     get_config_path,
@@ -325,4 +328,24 @@ def test_assets_text_capacity_and_clean_reader_labels_in_gui(
     assert combo_values == [["NSCCN XIXEI Smart Reader (0416:b030)"]]
     assert combo_selected == ["NSCCN XIXEI Smart Reader (0416:b030)"]
     assert r"\\?\hid#" not in combo_selected[0]
+
+
+def test_block_hex_utf8_sync_and_live_block_preview() -> None:
+    hex_str = utf8_text_to_block_hex("Witaj!")
+    assert len(hex_str.replace(" ", "")) == 32
+    assert block_hex_to_utf8_text(hex_str) == "Witaj!"
+
+    with pytest.raises(ValueError, match="przekracza"):
+        utf8_text_to_block_hex("A" * 17)
+
+    dump = MifareDump.empty(sectors=16)
+    preview = format_mifare_text_block_preview(
+        dump,
+        "1234567890123456" + "ABCDEFGHIJKLMNOP" + "XYZ",
+        start_block=1,
+    )
+    assert "Blok 001:" in preview
+    assert "Blok 002:" in preview
+    assert "Blok 003: [TRAILER — pominięty]" in preview
+    assert "Blok 004:" in preview
 

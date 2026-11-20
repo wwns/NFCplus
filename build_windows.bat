@@ -62,7 +62,7 @@ if errorlevel 1 (
 
 where makensis >nul 2>&1
 if not errorlevel 1 (
-    echo [NFCplus] Budowanie instalatora NSIS ^(dist\NFCplus-Setup-v0.1.1.exe^)...
+    echo [NFCplus] Budowanie instalatora NSIS ^(dist\NFCplus-Setup-v0.1.2.exe^)...
     makensis installer\nfcplus.nsi
     if errorlevel 1 (
         echo [NFCplus] Ostrzezenie: budowanie instalatora NSIS nie powiodlo sie.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nfcplus"
-version = "0.1.1"
+version = "0.1.2"
 description = "Czytelny, wieloplatformowy klient i sterownik USB HID dla czytników NFC/Mifare (wCopy / Xixei / NSR106)"
 readme = "docs/protocol.md"
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 hid = ["hidapi>=0.14.0"]
-build = ["pyinstaller>=6.0"]
+build = ["pyinstaller>=6.0", "pillow>=10.0"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

@@ -158,8 +158,37 @@ class MifareDump:
         self.sak = sak
 
     @classmethod
-    def empty(cls, blocks: int = 64) -> MifareDump:
-        return cls(bytes([0x00] * (blocks * MIFARE_BLOCK_SIZE)))
+    def empty(
+        cls,
+        blocks: int | None = None,
+        *,
+        sectors: int | None = None,
+        factory_trailers: bool | None = None,
+    ) -> MifareDump:
+        """Tworzy pusty zrzut Mifare Classic (domyślnie 16 sektorów z fabrycznymi trailerami)."""
+        blocks_by_sectors = {5: 20, 16: 64, 32: 128, 40: 256}
+        if sectors is not None:
+            if sectors not in blocks_by_sectors:
+                raise ValueError(
+                    f"Nieobsługiwana liczba sektorów: {sectors}. Oczekiwano: 5, 16, 32 lub 40."
+                )
+            total_blocks = blocks_by_sectors[sectors]
+            use_factory = True if factory_trailers is None else factory_trailers
+        elif blocks is None:
+            total_blocks = 64
+            use_factory = True if factory_trailers is None else factory_trailers
+        elif blocks in blocks_by_sectors:
+            total_blocks = blocks_by_sectors[blocks]
+            use_factory = True if factory_trailers is None else factory_trailers
+        else:
+            total_blocks = blocks
+            use_factory = bool(factory_trailers)
+
+        dump = cls(bytes([0x00] * (total_blocks * MIFARE_BLOCK_SIZE)))
+        if use_factory:
+            for s in range(dump.sector_count):
+                dump.set_block(dump.sector_block_range(s)[-1], FACTORY_MIFARE_TRAILER)
+        return dump
 
     @classmethod
     def from_blocks(
@@ -467,3 +496,21 @@ def decode_blocks_to_text(
         blocks = [blk for blk in blocks if blk <= end_block]
     raw = b"".join(dump.get_block(blk) for blk in blocks).rstrip(b"\x00")
     return raw.decode(encoding, errors="replace")
+
+
+def is_mostly_printable_text(data: bytes | str) -> bool:
+    """Sprawdza, czy dane po odcięciu końcowych zer są czytelnym tekstem bez znaków binarnych."""
+    if isinstance(data, bytes):
+        trimmed = data.rstrip(b"\x00")
+        if not trimmed:
+            return False
+        text = trimmed.decode("utf-8", errors="replace")
+    else:
+        text = data.rstrip("\x00")
+        if not text:
+            return False
+
+    if "\ufffd" in text:
+        return False
+    printable = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
+    return (printable / len(text)) >= 0.85

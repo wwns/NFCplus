@@ -31,6 +31,7 @@ from nfcplus.dump import (
     decode_value_block,
     encode_text_to_blocks,
     format_hex_ascii,
+    is_mostly_printable_text,
     parse_key_file,
     validate_access_bits,
     writable_data_blocks,
@@ -80,19 +81,25 @@ APDU_TEMPLATES: dict[str, str] = {
 
 
 def _enable_windows_dpi_awareness() -> None:
-    """Włącza skalowanie HiDPI w systemie Windows przed inicjalizacją okna."""
+    """Włącza skalowanie HiDPI oraz AppUserModelID w systemie Windows przed inicjalizacją okna."""
     if sys.platform != "win32":
         return
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        return
     try:
-        shcore = getattr(ctypes, "windll", None)
-        if shcore is not None and hasattr(shcore, "shcore"):
-            shcore.shcore.SetProcessDpiAwareness(1)
+        if hasattr(windll, "shell32"):
+            windll.shell32.SetCurrentProcessExplicitAppUserModelID("nfcplus.desktop.app")
+    except (AttributeError, OSError):
+        pass
+    try:
+        if hasattr(windll, "shcore"):
+            windll.shcore.SetProcessDpiAwareness(1)
             return
     except (AttributeError, OSError):
         pass
     try:
-        windll = getattr(ctypes, "windll", None)
-        if windll is not None and hasattr(windll, "user32"):
+        if hasattr(windll, "user32"):
             windll.user32.SetProcessDPIAware()
     except (AttributeError, OSError):
         pass
@@ -375,6 +382,51 @@ def format_mifare_text_capacity(total_blocks: int, start_block: int, text: str) 
     used_bytes = len(text.encode("utf-8"))
     used_blocks = (used_bytes + MIFARE_BLOCK_SIZE - 1) // MIFARE_BLOCK_SIZE if used_bytes > 0 else 0
     return used_bytes, max_bytes, used_blocks, max_blocks
+
+
+def block_hex_to_utf8_text(hex_value: str) -> str:
+    """Konwertuje 16-bajtowy zapis HEX pojedynczego bloku na tekst UTF-8 (ucina końcowe zera)."""
+    cleaned = hex_value.strip().replace(" ", "").replace(":", "").replace("-", "")
+    if len(cleaned) != MIFARE_BLOCK_SIZE * 2:
+        raise ValueError("Blok HEX musi mieć dokładnie 32 znaki.")
+    raw = bytes.fromhex(cleaned).rstrip(b"\x00")
+    return raw.decode("utf-8", errors="replace")
+
+
+def utf8_text_to_block_hex(text: str) -> str:
+    """Konwertuje tekst UTF-8 (maks. 16 B) na 16-bajtowy ciąg HEX rozdzielony spacjami."""
+    raw = text.encode("utf-8")
+    if len(raw) > MIFARE_BLOCK_SIZE:
+        raise ValueError(f"Tekst ({len(raw)} B) przekracza rozmiar jednego bloku (16 B).")
+    return raw.ljust(MIFARE_BLOCK_SIZE, b"\x00").hex(" ").upper()
+
+
+def format_mifare_text_block_preview(
+    dump: MifareDump,
+    text: str,
+    start_block: int = 1,
+    *,
+    clear_remaining: bool = False,
+) -> str:
+    """Buduje podgląd podziału tekstu UTF-8 na 16-bajtowe bloki z zaznaczeniem pominiętych trailerów."""
+    encoded_map = encode_text_to_blocks(
+        text,
+        dump.total_blocks,
+        start_block=start_block,
+        clear_remaining=clear_remaining,
+    )
+    if not encoded_map:
+        return "<brak bloków do zapisu>"
+    last_written = max(encoded_map)
+    lines: list[str] = []
+    for blk in range(start_block, last_written + 1):
+        if blk == 0:
+            lines.append("Blok 000: [UID / Producent — pominięty]")
+        elif dump.is_trailer_block(blk):
+            lines.append(f"Blok {blk:03d}: [TRAILER — pominięty]")
+        elif blk in encoded_map:
+            lines.append(f"Blok {blk:03d}: {format_hex_ascii(encoded_map[blk])}")
+    return "\n".join(lines)
 
 
 def format_audit_status_banner(report: CardAuditReport | None) -> tuple[str, str, str]:
@@ -1102,29 +1154,36 @@ class NFCPlusApp(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _apply_window_icon(self) -> None:
+        self._apply_toplevel_icon(self, delays_ms=(50, 250, 600))
+
+    def _apply_toplevel_icon(
+        self,
+        win: tk.Wm,
+        *,
+        delays_ms: tuple[int, ...] = (50, 250),
+    ) -> None:
+        png_path = _find_asset_path("nfcplus.png")
+        if png_path is not None:
+            try:
+                if self._app_icon_img is None:
+                    self._app_icon_img = tk.PhotoImage(file=str(png_path))
+                win.iconphoto(True, self._app_icon_img)
+            except (tk.TclError, OSError):
+                pass
         if sys.platform == "win32":
             ico_path = _find_asset_path("nfcplus.ico")
             if ico_path is not None:
                 ico_str = str(ico_path)
-                try:
-                    self.iconbitmap(default=ico_str)
-                except tk.TclError:
-                    pass
-                # CustomTkinter ustawia domyślną ikonę po 200 ms; nadpisujemy ją ponownie po 250 ms
-                self.after(250, lambda p=ico_str: self._set_win32_icon_safe(p))
-                return
-        png_path = _find_asset_path("nfcplus.png")
-        if png_path is not None:
-            try:
-                self._app_icon_img = tk.PhotoImage(file=str(png_path))
-                self.iconphoto(True, self._app_icon_img)
-            except tk.TclError:
-                pass
+                self._set_win32_icon_safe(win, ico_str)
+                for delay in delays_ms:
+                    self.after(delay, lambda target=win, p=ico_str: self._set_win32_icon_safe(target, p))
 
-    def _set_win32_icon_safe(self, ico_str: str) -> None:
+    @staticmethod
+    def _set_win32_icon_safe(win: tk.Wm, ico_str: str) -> None:
         try:
-            self.iconbitmap(default=ico_str)
-        except tk.TclError:
+            win.wm_iconbitmap(ico_str)
+            win.iconbitmap(default=ico_str)
+        except (tk.TclError, OSError):
             pass
 
     def _is_dark(self) -> bool:
@@ -1636,6 +1695,7 @@ class NFCPlusApp(ctk.CTk):
         win.title("Analiza uprawnień (Access Bits) i Value Block")
         win.geometry("760x520")
         win.transient(self)
+        self._apply_toplevel_icon(win)
         txt = ctk.CTkTextbox(win, font=(self._mono_font, 12), wrap="word")
         txt.pack(fill="both", expand=True, padx=12, pady=12)
         txt.insert("1.0", report)
@@ -1652,17 +1712,20 @@ class NFCPlusApp(ctk.CTk):
         dump = self._last_mifare_dump
         win = ctk.CTkToplevel(self)
         win.title("Edytuj blok w buforze Mifare")
-        win.geometry("540x240")
+        win.geometry("580x310")
         win.transient(self)
         win.grab_set()
         win.resizable(False, False)
+        self._apply_toplevel_icon(win)
 
         frame = ctk.CTkFrame(win, fg_color="transparent")
         frame.pack(fill="both", expand=True, padx=14, pady=14)
 
         block_var = tk.StringVar(value="4" if dump.total_blocks > 4 else "0")
         hex_var = tk.StringVar()
+        text_var = tk.StringVar()
         role_var = tk.StringVar()
+        syncing = {"active": False}
 
         def load_selected_block(*_: object) -> None:
             try:
@@ -1671,7 +1734,15 @@ class NFCPlusApp(ctk.CTk):
             except (ValueError, IndexError):
                 role_var.set(f"Nieprawidłowy numer bloku (zakres 0..{dump.total_blocks - 1}).")
                 return
-            hex_var.set(raw.hex(" ").upper())
+            syncing["active"] = True
+            try:
+                hex_var.set(raw.hex(" ").upper())
+                if is_mostly_printable_text(raw):
+                    text_var.set(block_hex_to_utf8_text(raw.hex()))
+                else:
+                    text_var.set("")
+            finally:
+                syncing["active"] = False
             if dump.is_trailer_block(blk):
                 status = "OK" if validate_access_bits(raw) else "BŁĘDNE"
                 role_var.set(f"Sektor {dump.sector_of_block(blk):02d} — TRAILER (bity dostępu: {status})")
@@ -1680,7 +1751,21 @@ class NFCPlusApp(ctk.CTk):
             else:
                 role_var.set(f"Sektor {dump.sector_of_block(blk):02d} — Blok danych")
 
-        def update_live_role(*_: object) -> None:
+        def on_hex_changed(*_: object) -> None:
+            if syncing["active"]:
+                return
+            syncing["active"] = True
+            try:
+                cleaned = hex_var.get().strip().replace(" ", "").replace(":", "").replace("-", "")
+                if len(cleaned) == 32:
+                    try:
+                        raw = bytes.fromhex(cleaned)
+                        text_var.set(raw.rstrip(b"\x00").decode("utf-8", errors="replace"))
+                    except ValueError:
+                        pass
+            finally:
+                syncing["active"] = False
+
             try:
                 blk = int(block_var.get().strip())
                 if not (0 <= blk < dump.total_blocks):
@@ -1703,6 +1788,20 @@ class NFCPlusApp(ctk.CTk):
                         pass
                 role_var.set(f"Sektor {dump.sector_of_block(blk):02d} — TRAILER (wymaga poprawnych bitów dostępu)")
 
+        def on_text_changed(*_: object) -> None:
+            if syncing["active"]:
+                return
+            syncing["active"] = True
+            try:
+                txt = text_var.get()
+                try:
+                    hex_var.set(utf8_text_to_block_hex(txt))
+                    role_var.set(f"Tekst UTF-8 ({len(txt.encode('utf-8'))}/16 B)")
+                except ValueError as exc:
+                    role_var.set(str(exc))
+            finally:
+                syncing["active"] = False
+
         row0 = ctk.CTkFrame(frame, fg_color="transparent")
         row0.pack(fill="x", pady=(0, 8))
         ctk.CTkLabel(row0, text=f"Numer bloku (0..{dump.total_blocks - 1}):").pack(side="left")
@@ -1710,10 +1809,16 @@ class NFCPlusApp(ctk.CTk):
         ctk.CTkButton(row0, text="Pobierz blok", width=110, command=load_selected_block).pack(side="left")
 
         ctk.CTkLabel(frame, textvariable=role_var).pack(anchor="w", pady=(0, 6))
-        ctk.CTkLabel(frame, text="Dane bloku (16 bajtów / 32 znaki HEX):").pack(anchor="w")
+        ctk.CTkLabel(frame, text="Dane bloku (32 znaki HEX):").pack(anchor="w")
         entry = ctk.CTkEntry(frame, textvariable=hex_var, font=(self._mono_font, 12))
-        entry.pack(fill="x", pady=(4, 12))
-        hex_var.trace_add("write", update_live_role)
+        entry.pack(fill="x", pady=(4, 8))
+
+        ctk.CTkLabel(frame, text="Tekst (UTF-8, maks. 16 B):").pack(anchor="w")
+        text_entry = ctk.CTkEntry(frame, textvariable=text_var, font=(self._mono_font, 12))
+        text_entry.pack(fill="x", pady=(4, 12))
+
+        hex_var.trace_add("write", on_hex_changed)
+        text_var.trace_add("write", on_text_changed)
 
         def save_edit() -> None:
             try:
@@ -1742,18 +1847,21 @@ class NFCPlusApp(ctk.CTk):
 
     def _do_write_text_to_mifare_buffer(self) -> None:
         if self._last_mifare_dump is None:
-            messagebox.showinfo(
-                "Brak bufora",
-                "Najpierw odczytaj kartę Mifare Classic lub wczytaj plik .dump do bufora.",
-            )
-            return
+            sectors = int(self.sectors_var.get()) if self.sectors_var.get() in ("5", "16", "32", "40") else 16
+            self._last_mifare_dump = MifareDump.empty(sectors=sectors)
+            self._last_mifare_header = f"Nowy czysty bufor Mifare ({sectors} sektorów)\n"
+            self._last_mifare_missing = set()
+            self._draw_sector_grid()
+            self._refresh_mifare_preview()
 
-        dump = self._last_mifare_dump
         win = ctk.CTkToplevel(self)
         win.title("Zapisz tekst przez bloki Mifare Classic")
-        win.geometry("600x430")
+        win.geometry("740x560")
+        win.minsize(640, 460)
         win.transient(self)
         win.grab_set()
+        win.resizable(True, True)
+        self._apply_toplevel_icon(win)
 
         frame = ctk.CTkFrame(win, fg_color="transparent")
         frame.pack(fill="both", expand=True, padx=14, pady=14)
@@ -1761,15 +1869,28 @@ class NFCPlusApp(ctk.CTk):
         start_var = tk.StringVar(value="1")
         clear_var = tk.BooleanVar(value=False)
         cap_var = tk.StringVar(value="")
+        size_label_map = {"Mini (5 sekt.)": 5, "1K (16 sekt.)": 16, "2K (32 sekt.)": 32, "4K (40 sekt.)": 40}
+        inv_size_map = {v: k for k, v in size_label_map.items()}
+        size_var = tk.StringVar(value=inv_size_map.get(self._last_mifare_dump.sector_count, "1K (16 sekt.)"))
 
         top_row = ctk.CTkFrame(frame, fg_color="transparent")
         top_row.pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(top_row, text=f"Blok początkowy (1..{dump.total_blocks - 1}):").pack(side="left")
-        ctk.CTkEntry(top_row, textvariable=start_var, width=70).pack(side="left", padx=(6, 10))
+        ctk.CTkLabel(top_row, text="Rozmiar:").pack(side="left")
+        ctk.CTkComboBox(
+            top_row,
+            variable=size_var,
+            values=list(size_label_map.keys()),
+            state="readonly",
+            width=125,
+            command=lambda val: on_size_changed(val),
+        ).pack(side="left", padx=(6, 10))
+        ctk.CTkLabel(top_row, text="Blok startowy:").pack(side="left")
+        ctk.CTkEntry(top_row, textvariable=start_var, width=60).pack(side="left", padx=(6, 10))
         ctk.CTkCheckBox(
             top_row,
-            text="Wyczyść pozostałe bloki danych (0x00)",
+            text="Wyczyść pozostałe bloki (0x00)",
             variable=clear_var,
+            command=lambda: update_capacity(),
         ).pack(side="left")
 
         ctk.CTkLabel(frame, textvariable=cap_var, anchor="w").pack(fill="x", pady=(0, 6))
@@ -1779,39 +1900,72 @@ class NFCPlusApp(ctk.CTk):
             anchor="w",
         ).pack(fill="x")
 
-        text_box = ctk.CTkTextbox(frame, font=(self._mono_font, 12), wrap="word")
-        text_box.pack(fill="both", expand=True, pady=(4, 10))
+        text_box = ctk.CTkTextbox(frame, height=160, font=(self._mono_font, 12), wrap="word")
+        text_box.pack(fill="both", expand=True, pady=(4, 8))
 
-        def load_decoded_text() -> None:
+        ctk.CTkLabel(frame, text="Podgląd podziału na bloki 16 B (na żywo):", anchor="w").pack(fill="x")
+        preview_box = ctk.CTkTextbox(frame, height=150, font=(self._mono_font, 11), state="disabled", wrap="none")
+        preview_box.pack(fill="both", expand=True, pady=(4, 10))
+
+        def current_dump() -> MifareDump:
+            assert self._last_mifare_dump is not None
+            return self._last_mifare_dump
+
+        def on_size_changed(choice: str) -> None:
+            target_sectors = size_label_map.get(choice, 16)
+            if current_dump().sector_count != target_sectors:
+                self._last_mifare_dump = MifareDump.empty(sectors=target_sectors)
+                self._last_mifare_header = f"Nowy czysty bufor Mifare ({target_sectors} sektorów)\n"
+                self._last_mifare_missing = set()
+                self.sectors_var.set(str(target_sectors))
+                self._draw_sector_grid()
+                self._refresh_mifare_preview()
+            update_capacity()
+
+        def load_decoded_text(*, force: bool = True) -> None:
+            dump = current_dump()
             try:
                 sb = int(start_var.get().strip())
                 decoded = decode_blocks_to_text(dump, start_block=sb)
             except (ValueError, IndexError) as exc:
-                messagebox.showerror("Błędny blok początkowy", str(exc), parent=win)
+                if force:
+                    messagebox.showerror("Błędny blok początkowy", str(exc), parent=win)
                 return
-            text_box.delete("1.0", "end")
-            text_box.insert("1.0", decoded)
+            if force or is_mostly_printable_text(decoded):
+                text_box.delete("1.0", "end")
+                text_box.insert("1.0", decoded)
             update_capacity()
 
         def update_capacity(*_: object) -> None:
+            dump = current_dump()
             try:
                 sb = int(start_var.get().strip())
                 txt = text_box.get("1.0", "end-1c")
                 ub, mb, ublk, mblk = format_mifare_text_capacity(dump.total_blocks, sb, txt)
                 status = "OK" if ub <= mb else "PRZEKROCZONO POJEMNOŚĆ!"
-                cap_var.set(f"Pojemność od bloku {sb}: {ub} / {mb} B ({ublk} / {mblk} bloków danych) — {status}")
-            except ValueError:
+                cap_var.set(f"Pojemność od bloku {sb}: {ub} / {mb} B — zajmie {ublk} / {mblk} bloków danych ({status})")
+                if ub <= mb:
+                    preview = format_mifare_text_block_preview(
+                        dump, txt, start_block=sb, clear_remaining=bool(clear_var.get())
+                    )
+                else:
+                    preview = f"Tekst ({ub} B) przekracza dostępną pojemność ({mb} B)."
+            except ValueError as exc:
                 cap_var.set("Podaj poprawny numer bloku początkowego.")
+                preview = str(exc)
+            self._set_text(preview_box, preview)
 
-        ctk.CTkButton(top_row, text="Odczytaj z bufora", width=120, command=load_decoded_text).pack(side="right")
+        ctk.CTkButton(top_row, text="Odczytaj z bufora", width=120, command=lambda: load_decoded_text(force=True)).pack(
+            side="right"
+        )
         start_var.trace_add("write", update_capacity)
         text_box.bind("<KeyRelease>", lambda _e: update_capacity())
 
-        def save_text() -> None:
+        def _commit_text_to_buffer() -> bool:
+            dump = current_dump()
             try:
                 sb = int(start_var.get().strip())
                 txt = text_box.get("1.0", "end-1c")
-                # Wstępna walidacja pojemności przed modyfikacją bufora
                 encode_text_to_blocks(
                     txt,
                     dump.total_blocks,
@@ -1821,19 +1975,29 @@ class NFCPlusApp(ctk.CTk):
                 updated = dump.write_text(txt, start_block=sb, clear_remaining=bool(clear_var.get()))
             except (ValueError, IndexError) as exc:
                 messagebox.showerror("Błąd zapisu tekstu", str(exc), parent=win)
-                return
+                return False
             for blk in updated:
                 self._last_mifare_missing.discard(blk)
             self._refresh_mifare_preview()
             self._log(f"Zapisano tekst ({len(txt.encode('utf-8'))} B) do {len(updated)} bloków bufora od bloku {sb}.")
-            win.destroy()
+            return True
+
+        def save_only() -> None:
+            if _commit_text_to_buffer():
+                win.destroy()
+
+        def save_and_write_card() -> None:
+            if _commit_text_to_buffer():
+                win.destroy()
+                self._do_write_mifare_dump()
 
         btns = ctk.CTkFrame(frame, fg_color="transparent")
         btns.pack(fill="x")
-        ctk.CTkButton(btns, text="Zapisz tekst w buforze", command=save_text).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Zapisz i wgraj na kartę", command=save_and_write_card).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Zapisz tekst w buforze", command=save_only).pack(side="right", padx=(8, 0))
         ctk.CTkButton(btns, text="Anuluj", command=win.destroy).pack(side="right")
 
-        load_decoded_text()
+        load_decoded_text(force=False)
         text_box.focus_set()
 
     def _do_write_mifare_dump(self) -> None:

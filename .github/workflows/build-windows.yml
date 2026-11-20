@@ -39,6 +39,10 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed --icon assets/nfcplus.ico --add-data "assets/nfcplus.ico;assets" --add-data "assets/nfcplus.png;assets" --collect-all customtkinter --name NFCplus --paths src src/nfcplus/app.py
 
+      - name: Verify PE icon resources in NFCplus.exe
+        run: |
+          python -c "import pefile; pe = pefile.PE('dist/NFCplus.exe'); types = [e.id for e in pe.DIRECTORY_ENTRY_RESOURCE.entries]; print('PE resource types:', types); assert 14 in types and 3 in types, f'Missing icon resources: {types}'"
+
       - name: Build NSIS Installer (NFCplus-Setup)
         shell: pwsh
         run: |
