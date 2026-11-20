@@ -464,3 +464,36 @@ def test_acr122u_connection_status_lf_guard_and_scan_all(
         )
     )
 
+
+def test_toggle_connect_closes_transport_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed = {"count": 0}
+    errors: list[tuple[str, str]] = []
+
+    class BrokenReader:
+        def __init__(self, _transport: object) -> None:
+            pass
+
+        def get_device_info(self) -> dict[str, str]:
+            raise TransportError("nieudane info")
+
+    fake_dev = DeviceInfo(vid=0x072F, pid=0x2200, path="ACS ACR122U 0", backend="winscard")
+    fake_transport = SimpleNamespace(close=lambda: closed.__setitem__("count", closed["count"] + 1))
+
+    monkeypatch.setattr(app_mod, "open_reader", lambda path=None: (fake_dev, fake_transport))
+    monkeypatch.setattr(app_mod, "NFCReader", BrokenReader)
+    monkeypatch.setattr(
+        app_mod.messagebox,
+        "showerror",
+        lambda title, msg: errors.append((title, msg)),
+    )
+
+    fake_app = SimpleNamespace(
+        _reader=None,
+        _selected_device_path=lambda: "ACS ACR122U 0",
+    )
+    NFCPlusApp._toggle_connect(fake_app)  # type: ignore[arg-type]
+
+    assert closed["count"] == 1
+    assert len(errors) == 1
+    assert "nieudane info" in errors[0][1]
+

@@ -1382,11 +1382,17 @@ class NFCPlusApp(ctk.CTk):
             self._disconnect()
             return
         path = self._selected_device_path()
+        transport: HIDTransport | None = None
         try:
             dev_info, transport = open_reader(path=path)
             reader = NFCReader(transport)
             info = reader.get_device_info()
-        except (TransportError, ProtocolError, TimeoutError) as exc:
+        except (TransportError, ProtocolError, TimeoutError, OSError) as exc:
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:  # noqa: BLE001
+                    pass
             messagebox.showerror("Błąd połączenia", str(exc))
             return
         self._apply_connected_reader(dev_info, transport, reader, info)

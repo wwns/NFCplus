@@ -52,6 +52,7 @@ from .transport import (
     HIDTransport,
     LinuxPcscTransport,
     LinuxUsbCcidTransport,
+    NoSmartCardError,
     TransportError,
     WindowsPcscTransport,
     enumerate_readers,

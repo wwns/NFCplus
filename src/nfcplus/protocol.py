@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from .dump import FACTORY_MIFARE_TRAILER, MifareDump, validate_access_bits
-from .transport import HIDTransport
+from .transport import HIDTransport, NoSmartCardError, TransportError
 
 REPORT_SIZE = 64
 MAX_PAYLOAD_SIZE = 48
@@ -553,6 +553,45 @@ def _crc16_a(data: bytes) -> bytes:
     return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
 
+def _is_pcsc_escape_blocked(exc: Exception) -> bool:
+    """Sprawdza, czy błąd wynika z zablokowanego IOCTL_CCID_ESCAPE w sterowniku PC/SC."""
+    if isinstance(exc, NoSmartCardError):
+        return False
+    if isinstance(exc, TransportError):
+        return True
+    if isinstance(exc, ProtocolError):
+        msg = str(exc).upper()
+        return any(code in msg for code in ("6D 00", "6E 00", "6F 00", "68 00"))
+    return False
+
+
+def _card_info_from_pcsc_atr(uid: bytes, atr: bytes | None) -> CardInfo:
+    """Buduje CardInfo na podstawie UID (FF CA) i opcjonalnego ATR PC/SC 2.01."""
+    atqa = b"\x04\x00"
+    sak = 0x08
+    if atr:
+        marker = b"\xa0\x00\x00\x03\x06"
+        idx = atr.find(marker)
+        if idx != -1 and len(atr) >= idx + 8:
+            card_name = (atr[idx + 6], atr[idx + 7])
+            if card_name == (0x00, 0x01):
+                atqa, sak = b"\x04\x00", 0x08
+            elif card_name == (0x00, 0x02):
+                atqa, sak = b"\x02\x00", 0x18
+            elif card_name == (0x00, 0x03):
+                atqa, sak = b"\x44\x00", 0x00
+            elif card_name == (0x00, 0x26):
+                atqa, sak = b"\x04\x00", 0x09
+    elif len(uid) == 7:
+        atqa, sak = b"\x44\x00", 0x00
+    return CardInfo(
+        uid=uid,
+        atqa=atqa,
+        sak=sak,
+        card_type=classify_iso14443a_card(atqa, sak),
+    )
+
+
 class NFCReader:
     """Wysokopoziomowy sterownik czytników wCopy / Xixei / NFC Pro."""
 
@@ -561,6 +600,7 @@ class NFCReader:
         self._timeout_ms = timeout_ms
         self._seq = 0
         self._set_params_flags = 0x00
+        self._pcsc_fallback = False
         self.last_sector_auth: dict[int, tuple[bool, bool]] = {}
 
     def _next_seq(self) -> int:
@@ -614,8 +654,15 @@ class NFCReader:
     def get_firmware_version(self) -> str:
         """Pobiera wersję firmware (FF 00 68 dla wCopy lub FF 00 48 00 00 dla ACR122U)."""
         if self.is_acr122u:
-            resp = self._transport.apdu_exchange(b"\xff\x00\x48\x00\x00", timeout_ms=self._timeout_ms)
-            return resp.rstrip(b"\x00").decode("ascii", errors="replace").strip()
+            if self._pcsc_fallback:
+                return "ACS ACR122U (PC/SC)"
+            try:
+                resp = self._transport.apdu_exchange(b"\xff\x00\x48\x00\x00", timeout_ms=self._timeout_ms)
+                return resp.rstrip(b"\x00").decode("ascii", errors="replace").strip()
+            except (TransportError, ProtocolError) as exc:
+                if _is_pcsc_escape_blocked(exc):
+                    self._pcsc_fallback = True
+                return "ACS ACR122U (PC/SC)"
         # Nowsze warianty firmware (np. NSR122-HID V901N1) zwracają ramki 0x02...0xFD także dla komend natywnych.
         resp = self.exchange_raw(b"\xff\x00\x68", expected_start=(START_NATIVE, START_PN532))
         return resp.rstrip(b"\x00").decode("ascii", errors="replace").strip()
@@ -639,10 +686,17 @@ class NFCReader:
         """Uruchamia brzęczyk czytnika na podany czas (w ms)."""
         dur = max(1, (duration_ms // 10) & 0xFF)
         if self.is_acr122u:
-            resp = self._transport.apdu_exchange(
-                bytes([0xFF, 0x00, 0x40, 0x00, 0x04, dur, 0x00, 0x01, 0x01]),
-                timeout_ms=self._timeout_ms,
-            )
+            if self._pcsc_fallback:
+                return
+            try:
+                resp = self._transport.apdu_exchange(
+                    bytes([0xFF, 0x00, 0x40, 0x00, 0x04, dur, 0x00, 0x01, 0x01]),
+                    timeout_ms=self._timeout_ms,
+                )
+            except (TransportError, ProtocolError) as exc:
+                if _is_pcsc_escape_blocked(exc):
+                    self._pcsc_fallback = True
+                return
             # ACR122U zwraca 90 <LED_STATE> (bit 0 = czerwony, bit 1 = zielony), np. 90 00..90 03.
             if len(resp) < 2 or resp[-2] != 0x90:
                 raise ProtocolError(f"Błąd brzęczyka ACR122U: {resp.hex(' ')}")
@@ -740,37 +794,85 @@ class NFCReader:
     # Wykrywanie kart
     # ------------------------------------------------------------------
 
-    def scan_card(self, init_rf: bool = True) -> CardInfo | None:
-        """Skanuje pojedynczą kartę ISO14443A przez InListPassiveTarget (0x4A)."""
-        if init_rf:
-            self.init_rf()
-
-        resp = self.pn532_command(b"\x4a\x01\x00")
-        # Część czytników (np. NSR122-HID V901N1) sygnalizuje brak karty statusem 63 00 zamiast NbTg=0.
-        if not resp or resp[0] == 0 or resp == b"\x63\x00":
+    def _pcsc_scan_card(self) -> CardInfo | None:
+        try:
+            resp = self._transport.apdu_exchange(b"\xff\xca\x00\x00\x00", timeout_ms=self._timeout_ms)
+        except NoSmartCardError:
             return None
+        if len(resp) < 2:
+            raise ProtocolError(f"Za krótka odpowiedź PC/SC Get UID: {resp.hex(' ')}")
+        sw = resp[-2:]
+        if sw in (b"\x6a\x81", b"\x63\x00"):
+            return None
+        if sw != b"\x90\x00":
+            raise ProtocolError(f"Błąd PC/SC Get UID (FF CA): {sw.hex(' ').upper()}")
+        uid = resp[:-2]
+        atr = self._transport.get_atr() if hasattr(self._transport, "get_atr") else None
+        return _card_info_from_pcsc_atr(uid, atr)
 
-        if len(resp) < 6:
-            raise ProtocolError(f"Niekompletna odpowiedź InListPassiveTarget: {resp.hex(' ')}")
+    def _pcsc_mifare_auth(self, block: int, key: bytes, kt: str) -> bool:
+        load_resp = self._transport.apdu_exchange(b"\xff\x82\x00\x00\x06" + key, timeout_ms=self._timeout_ms)
+        if len(load_resp) < 2 or load_resp[-2:] != b"\x90\x00":
+            return False
+        key_type_byte = 0x60 if kt == "A" else 0x61
+        auth_apdu = bytes([0xFF, 0x86, 0x00, 0x00, 0x05, 0x01, 0x00, block & 0xFF, key_type_byte, 0x00])
+        auth_resp = self._transport.apdu_exchange(auth_apdu, timeout_ms=self._timeout_ms)
+        return len(auth_resp) >= 2 and auth_resp[-2:] == b"\x90\x00"
 
-        atqa = bytes([resp[3], resp[2]])
-        sak = resp[4]
-        uid_len = resp[5]
-        uid = resp[6 : 6 + uid_len]
-        if len(uid) != uid_len:
-            raise ProtocolError(f"Skrócony UID w odpowiedzi: oczekiwano {uid_len} B, jest {len(uid)} B")
+    def _pcsc_read_binary(self, block_or_page: int, length: int) -> bytes:
+        apdu = bytes([0xFF, 0xB0, 0x00, block_or_page & 0xFF, length & 0xFF])
+        resp = self._transport.apdu_exchange(apdu, timeout_ms=self._timeout_ms)
+        if len(resp) < 2 + length or resp[-2:] != b"\x90\x00":
+            raise ProtocolError(f"Błąd odczytu PC/SC (FF B0 {block_or_page}): {resp.hex(' ')}")
+        return resp[:length]
 
-        # Wybór domyślnego 106 kbps (InPSL 0x4E) jak w FUN_14004bda0
-        self.pn532_command(b"\x4e\x01\x00\x00")
-        self.set_crc(True)
-        self.set_parity(True)
+    def _pcsc_update_binary(self, block_or_page: int, data: bytes) -> None:
+        apdu = bytes([0xFF, 0xD6, 0x00, block_or_page & 0xFF, len(data) & 0xFF]) + data
+        resp = self._transport.apdu_exchange(apdu, timeout_ms=self._timeout_ms)
+        if len(resp) < 2 or resp[-2:] != b"\x90\x00":
+            raise ProtocolError(f"Błąd zapisu PC/SC (FF D6 {block_or_page}): {resp.hex(' ')}")
 
-        return CardInfo(
-            uid=uid,
-            atqa=atqa,
-            sak=sak,
-            card_type=classify_iso14443a_card(atqa, sak),
-        )
+    def scan_card(self, init_rf: bool = True) -> CardInfo | None:
+        """Skanuje pojedynczą kartę ISO14443A przez InListPassiveTarget (0x4A) lub PC/SC FF CA."""
+        if self.is_acr122u and self._pcsc_fallback:
+            return self._pcsc_scan_card()
+        try:
+            if init_rf:
+                self.init_rf()
+
+            resp = self.pn532_command(b"\x4a\x01\x00")
+            # Część czytników (np. NSR122-HID V901N1) sygnalizuje brak karty statusem 63 00 zamiast NbTg=0.
+            if not resp or resp[0] == 0 or resp == b"\x63\x00":
+                return None
+
+            if len(resp) < 6:
+                raise ProtocolError(f"Niekompletna odpowiedź InListPassiveTarget: {resp.hex(' ')}")
+
+            atqa = bytes([resp[3], resp[2]])
+            sak = resp[4]
+            uid_len = resp[5]
+            uid = resp[6 : 6 + uid_len]
+            if len(uid) != uid_len:
+                raise ProtocolError(f"Skrócony UID w odpowiedzi: oczekiwano {uid_len} B, jest {len(uid)} B")
+
+            # Wybór domyślnego 106 kbps (InPSL 0x4E) jak w FUN_14004bda0
+            self.pn532_command(b"\x4e\x01\x00\x00")
+            self.set_crc(True)
+            self.set_parity(True)
+
+            return CardInfo(
+                uid=uid,
+                atqa=atqa,
+                sak=sak,
+                card_type=classify_iso14443a_card(atqa, sak),
+            )
+        except (TransportError, ProtocolError) as exc:
+            if isinstance(exc, NoSmartCardError):
+                return None
+            if self.is_acr122u and _is_pcsc_escape_blocked(exc):
+                self._pcsc_fallback = True
+                return self._pcsc_scan_card()
+            raise
 
     def high_level_scan(self) -> CardInfo | None:
         """Alternatywne skanowanie wysokopoziomowe komendą FF 00 6B 30 (FUN_140046110)."""
@@ -805,15 +907,31 @@ class NFCReader:
             raise ValueError("Typ klucza musi wynosić 'A' lub 'B'.")
 
         cmd_code = 0x60 if kt == "A" else 0x61
+        if self.is_acr122u and self._pcsc_fallback:
+            return self._pcsc_mifare_auth(block, key, kt)
         # Dla 7-bajtowych UID autoryzacja używa ostatnich 4 bajtów lub pierwszych 4 bajtów zależnie od kaskady;
         # zgodnie z FUN_1400426d0 używamy 4 bajtów UID przekazanych w parametrze (dla 7B zwykle uid[-4:]).
         uid4 = uid[-4:] if len(uid) > 4 else uid[:4]
-        resp = self.pn532_command(bytes([0x40, 0x01, cmd_code, block & 0xFF]) + key + uid4)
+        try:
+            resp = self.pn532_command(bytes([0x40, 0x01, cmd_code, block & 0xFF]) + key + uid4)
+        except (TransportError, ProtocolError) as exc:
+            if self.is_acr122u and _is_pcsc_escape_blocked(exc):
+                self._pcsc_fallback = True
+                return self._pcsc_mifare_auth(block, key, kt)
+            raise
         return len(resp) >= 1 and resp[0] == 0x00
 
     def mifare_read_block(self, block: int) -> bytes:
-        """Odczytuje 16-bajtowy blok Mifare Classic (0x30)."""
-        resp = self.pn532_command(bytes([0x40, 0x01, 0x30, block & 0xFF]))
+        """Odczytuje 16-bajtowy blok Mifare Classic (0x30 lub PC/SC FF B0)."""
+        if self.is_acr122u and self._pcsc_fallback:
+            return self._pcsc_read_binary(block, 16)
+        try:
+            resp = self.pn532_command(bytes([0x40, 0x01, 0x30, block & 0xFF]))
+        except (TransportError, ProtocolError) as exc:
+            if self.is_acr122u and _is_pcsc_escape_blocked(exc):
+                self._pcsc_fallback = True
+                return self._pcsc_read_binary(block, 16)
+            raise
         if self.is_acr122u:
             if len(resp) == 17 and resp[0] == 0x00:
                 return resp[1:17]
@@ -825,10 +943,20 @@ class NFCReader:
         return resp[1:17]
 
     def mifare_write_block(self, block: int, data: bytes) -> None:
-        """Zapisuje 16-bajtowy blok Mifare Classic (0xA0)."""
+        """Zapisuje 16-bajtowy blok Mifare Classic (0xA0 lub PC/SC FF D6)."""
         if len(data) != 16:
             raise ValueError("Blok Mifare Classic musi mieć dokładnie 16 bajtów.")
-        resp = self.pn532_command(bytes([0x40, 0x01, 0xA0, block & 0xFF]) + data)
+        if self.is_acr122u and self._pcsc_fallback:
+            self._pcsc_update_binary(block, data)
+            return
+        try:
+            resp = self.pn532_command(bytes([0x40, 0x01, 0xA0, block & 0xFF]) + data)
+        except (TransportError, ProtocolError) as exc:
+            if self.is_acr122u and _is_pcsc_escape_blocked(exc):
+                self._pcsc_fallback = True
+                self._pcsc_update_binary(block, data)
+                return
+            raise
         valid = (b"\x00", b"\x00\x90\x00") if self.is_acr122u else (b"\x00\x90\x00",)
         if resp not in valid:
             raise ProtocolError(f"Błąd zapisu bloku {block}: {resp.hex(' ')}")
@@ -1076,10 +1204,31 @@ class NFCReader:
     # NTAG / MIFARE Ultralight EV1
     # ------------------------------------------------------------------
 
+    def _pcsc_infer_ntag_version(self) -> NtagVersion:
+        """Wnioskuje wariant NTAG z bloku CC (strona 3) w trybie PC/SC."""
+        cc = self._pcsc_read_binary(3, 4)
+        size_code = cc[2]
+        if size_code == 0x12:
+            return NtagVersion(raw=b"\x00" * 8, name="NTAG213 (PC/SC)", total_pages=45, total_bytes=180)
+        if size_code == 0x3E:
+            return NtagVersion(raw=b"\x00" * 8, name="NTAG215 (PC/SC)", total_pages=135, total_bytes=540)
+        if size_code == 0x6D:
+            return NtagVersion(raw=b"\x00" * 8, name="NTAG216 (PC/SC)", total_pages=231, total_bytes=924)
+        pages = max(45, (size_code * 8) // 4 + 9) if size_code else 45
+        return NtagVersion(raw=b"\x00" * 8, name="NTAG/Ultralight (PC/SC)", total_pages=pages, total_bytes=pages * 4)
+
     def ntag_get_version(self) -> NtagVersion:
         """Odczytuje wersję układu NTAG / Ultralight EV1 (0x60 na ACR122U lub 0x62 w wCopy)."""
         if self.is_acr122u:
-            resp = self.pn532_command(b"\x40\x01\x60")
+            if self._pcsc_fallback:
+                return self._pcsc_infer_ntag_version()
+            try:
+                resp = self.pn532_command(b"\x40\x01\x60")
+            except (TransportError, ProtocolError) as exc:
+                if _is_pcsc_escape_blocked(exc):
+                    self._pcsc_fallback = True
+                    return self._pcsc_infer_ntag_version()
+                raise
             if len(resp) == 9 and resp[0] == 0x00:
                 ver = resp[1:9]
             elif len(resp) in (12, 14) and resp[0] == 0x00 and resp[1] == 0x50 and resp[-2:] == b"\x90\x00":
@@ -1098,8 +1247,16 @@ class NFCReader:
         return NtagVersion(raw=ver, name=name, total_pages=pages, total_bytes=total_bytes)
 
     def ntag_read_page(self, page: int) -> bytes:
-        """Odczytuje pojedynczą 4-bajtową stronę NTAG przez FAST_READ (0x3A)."""
-        resp = self.pn532_command(bytes([0x40, 0x01, 0x3A, page & 0xFF, page & 0xFF]))
+        """Odczytuje pojedynczą 4-bajtową stronę NTAG przez FAST_READ (0x3A) lub PC/SC FF B0."""
+        if self.is_acr122u and self._pcsc_fallback:
+            return self._pcsc_read_binary(page, 4)
+        try:
+            resp = self.pn532_command(bytes([0x40, 0x01, 0x3A, page & 0xFF, page & 0xFF]))
+        except (TransportError, ProtocolError) as exc:
+            if self.is_acr122u and _is_pcsc_escape_blocked(exc):
+                self._pcsc_fallback = True
+                return self._pcsc_read_binary(page, 4)
+            raise
         if self.is_acr122u:
             if len(resp) < 5 or resp[0] != 0x00:
                 raise ProtocolError(f"Błąd odczytu strony {page}: {resp.hex(' ')}")
@@ -1175,12 +1332,26 @@ class NFCReader:
         *,
         password: bytes | None = None,
     ) -> None:
-        """Zapisuje 4-bajtową stronę NTAG (komenda 0xA2)."""
+        """Zapisuje 4-bajtową stronę NTAG (komenda 0xA2 lub PC/SC FF D6)."""
         if len(data) != 4:
             raise ValueError("Strona NTAG musi mieć dokładnie 4 bajty.")
+        if self.is_acr122u and self._pcsc_fallback:
+            if password is not None:
+                raise ProtocolError("Autoryzacja hasłem NTAG (PWD_AUTH) wymaga włączonego EscapeCommandEnable.")
+            self._pcsc_update_binary(page, data)
+            return
         if password is not None:
             self.ntag_pwd_auth(password)
-        resp = self.pn532_command(bytes([0x40, 0x01, 0xA2, page & 0xFF]) + data)
+        try:
+            resp = self.pn532_command(bytes([0x40, 0x01, 0xA2, page & 0xFF]) + data)
+        except (TransportError, ProtocolError) as exc:
+            if self.is_acr122u and _is_pcsc_escape_blocked(exc):
+                self._pcsc_fallback = True
+                if password is not None:
+                    raise ProtocolError("Autoryzacja hasłem NTAG (PWD_AUTH) wymaga włączonego EscapeCommandEnable.") from exc
+                self._pcsc_update_binary(page, data)
+                return
+            raise
         valid = (b"\x00", b"\x00\x90\x00") if self.is_acr122u else (b"\x00\x90\x00",)
         if resp not in valid:
             raise ProtocolError(f"Błąd zapisu strony {page}: {resp.hex(' ')}")

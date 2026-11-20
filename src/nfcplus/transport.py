@@ -28,6 +28,10 @@ class TransportError(RuntimeError):
     """Błąd komunikacji z urządzeniem USB HID."""
 
 
+class NoSmartCardError(TransportError):
+    """Brak karty lub tagu na czytniku PC/SC (SCARD_E_NO_SMARTCARD / SCARD_W_REMOVED_CARD)."""
+
+
 @dataclass(frozen=True)
 class DeviceInfo:
     """Metadane wykrytego czytnika USB HID lub CCID (ACR122U)."""
@@ -1056,6 +1060,11 @@ _SCARD_SHARE_SHARED = 2
 _SCARD_SHARE_DIRECT = 3
 _SCARD_LEAVE_CARD = 0
 _SCARD_PROTOCOL_TX = 0x0003
+_SCARD_E_SHARING_VIOLATION = 0x8010000B
+_SCARD_E_NO_SMARTCARD = 0x8010000C
+_SCARD_W_RESET_CARD = 0x80100068
+_SCARD_W_REMOVED_CARD = 0x80100069
+_SCARD_NO_CARD_ERRORS = (_SCARD_E_NO_SMARTCARD, _SCARD_W_REMOVED_CARD)
 _IOCTL_CCID_ESCAPE_WIN = 0x003136B0
 _IOCTL_CCID_ESCAPE_LINUX = 0x42000DAC
 _IOCTL_CCID_ALT_LINUX = 0x42000D48
@@ -1121,6 +1130,15 @@ class _BasePcscTransport(HIDTransport):
     def is_open(self) -> bool:
         return self._card is not None
 
+    @property
+    def pcsc_card_present(self) -> bool:
+        """True, gdy połączenie PC/SC ma aktywny protokół karty (T=0/T=1)."""
+        return self._card is not None and self._active_protocol != 0
+
+    def get_atr(self) -> bytes | None:
+        """Zwraca ATR obecnej karty w trybie PC/SC lub None."""
+        return None
+
     def write(self, data: bytes) -> int:
         raise TransportError("Czytnik ACR122U używa apdu_exchange(), nie surowych raportów HID 64 B.")
 
@@ -1155,47 +1173,155 @@ class WindowsPcscTransport(_BasePcscTransport):
             api.SCardConnectW(
                 ctx,
                 self._reader_name,
-                _SCARD_SHARE_DIRECT,
-                0,
+                _SCARD_SHARE_SHARED,
+                _SCARD_PROTOCOL_TX,
                 ctypes.byref(card),
                 ctypes.byref(proto),
             )
         )
         if rc != 0:
-            rc = int(
-                api.SCardConnectW(
-                    ctx,
-                    self._reader_name,
-                    _SCARD_SHARE_SHARED,
-                    _SCARD_PROTOCOL_TX,
-                    ctypes.byref(card),
-                    ctypes.byref(proto),
+            rc_u32 = rc & 0xFFFFFFFF
+            if rc_u32 != _SCARD_E_SHARING_VIOLATION:
+                rc = int(
+                    api.SCardConnectW(
+                        ctx,
+                        self._reader_name,
+                        _SCARD_SHARE_DIRECT,
+                        0,
+                        ctypes.byref(card),
+                        ctypes.byref(proto),
+                    )
                 )
-            )
         if rc != 0:
-            api.SCardReleaseContext(ctx)
+            rc_u32 = rc & 0xFFFFFFFF
+            try:
+                api.SCardReleaseContext(ctx)
+            except Exception:
+                pass
+            if rc_u32 == _SCARD_E_SHARING_VIOLATION:
+                raise TransportError(
+                    f"Czytnik '{self._reader_name}' jest zajęty przez inny proces (0x8010000B). "
+                    "Zamknij inne aplikacje NFC i spróbuj ponownie."
+                )
             raise TransportError(
-                f"SCardConnectW('{self._reader_name}') nie powiodło się (0x{rc & 0xFFFFFFFF:08X})."
+                f"SCardConnectW('{self._reader_name}') nie powiodło się (0x{rc_u32:08X})."
             )
         self._ctx = ctx
         self._card = card
         self._active_protocol = int(proto.value)
 
     def close(self) -> None:
-        if self._dll is not None:
-            if self._card is not None:
-                try:
-                    self._dll.SCardDisconnect(self._card, _SCARD_LEAVE_CARD)
-                except Exception:
-                    pass
-                self._card = None
-            if self._ctx is not None:
-                try:
-                    self._dll.SCardReleaseContext(self._ctx)
-                except Exception:
-                    pass
-                self._ctx = None
-        self._active_protocol = 0
+        try:
+            if self._dll is not None:
+                if self._card is not None:
+                    try:
+                        self._dll.SCardDisconnect(self._card, _SCARD_LEAVE_CARD)
+                    except Exception:
+                        pass
+                if self._ctx is not None:
+                    try:
+                        self._dll.SCardReleaseContext(self._ctx)
+                    except Exception:
+                        pass
+        finally:
+            self._card = None
+            self._ctx = None
+            self._active_protocol = 0
+
+    def get_atr(self) -> bytes | None:
+        if self._card is None:
+            return None
+        api = self._api()
+        status_fn = getattr(api, "SCardStatusW", None)
+        if status_fn is None:
+            return None
+        reader_buf = (ctypes.c_wchar * 256)()
+        reader_len = ctypes.c_uint32(256)
+        state = ctypes.c_uint32(0)
+        proto = ctypes.c_uint32(0)
+        atr_buf = (ctypes.c_ubyte * 64)()
+        atr_len = ctypes.c_uint32(64)
+        rc = int(
+            status_fn(
+                self._card,
+                reader_buf,
+                ctypes.byref(reader_len),
+                ctypes.byref(state),
+                ctypes.byref(proto),
+                atr_buf,
+                ctypes.byref(atr_len),
+            )
+        )
+        if rc != 0 or int(atr_len.value) <= 0:
+            return None
+        return bytes(atr_buf[: int(atr_len.value)])
+
+    def _reconnect_shared(self, api: Any) -> None:
+        """Przełącza uchwyt karty do SCARD_SHARE_SHARED (T=0/T=1), gdy karta jest obecna."""
+        proto = ctypes.c_uint32(0)
+        reconnect_fn = getattr(api, "SCardReconnect", None)
+        if reconnect_fn is not None:
+            rc = int(
+                reconnect_fn(
+                    self._card,
+                    _SCARD_SHARE_SHARED,
+                    _SCARD_PROTOCOL_TX,
+                    _SCARD_LEAVE_CARD,
+                    ctypes.byref(proto),
+                )
+            )
+            if rc == 0 and int(proto.value) != 0:
+                self._active_protocol = int(proto.value)
+                return
+            rc_u32 = rc & 0xFFFFFFFF
+            if rc_u32 in _SCARD_NO_CARD_ERRORS:
+                raise NoSmartCardError("Brak karty lub tagu na czytniku ACR122U.")
+
+        if self._card is not None:
+            try:
+                api.SCardDisconnect(self._card, _SCARD_LEAVE_CARD)
+            except Exception:
+                pass
+            self._card = None
+            self._active_protocol = 0
+
+        card = ctypes.c_void_p()
+        rc = int(
+            api.SCardConnectW(
+                self._ctx,
+                self._reader_name,
+                _SCARD_SHARE_SHARED,
+                _SCARD_PROTOCOL_TX,
+                ctypes.byref(card),
+                ctypes.byref(proto),
+            )
+        )
+        if rc == 0:
+            self._card = card
+            self._active_protocol = int(proto.value)
+            return
+
+        rc_u32 = rc & 0xFFFFFFFF
+        direct_card = ctypes.c_void_p()
+        direct_proto = ctypes.c_uint32(0)
+        if (
+            int(
+                api.SCardConnectW(
+                    self._ctx,
+                    self._reader_name,
+                    _SCARD_SHARE_DIRECT,
+                    0,
+                    ctypes.byref(direct_card),
+                    ctypes.byref(direct_proto),
+                )
+            )
+            == 0
+        ):
+            self._card = direct_card
+            self._active_protocol = int(direct_proto.value)
+        if rc_u32 in _SCARD_NO_CARD_ERRORS:
+            raise NoSmartCardError("Brak karty lub tagu na czytniku ACR122U.")
+        raise TransportError(f"SCardReconnect/SCardConnectW(SHARED) nie powiodło się (0x{rc_u32:08X}).")
 
     def apdu_exchange(self, apdu: bytes, timeout_ms: int = 2000) -> bytes:
         if self._card is None:
@@ -1220,27 +1346,38 @@ class WindowsPcscTransport(_BasePcscTransport):
             if rc == 0:
                 return bytes(recv_buf[: int(recv_len.value)])
             if self._active_protocol == 0:
-                raise TransportError(f"SCardControl(ACR122U) nie powiodło się (0x{rc & 0xFFFFFFFF:08X}).")
+                if apdu[:2] != b"\xff\x00":
+                    self._reconnect_shared(api)
+                else:
+                    raise TransportError(f"SCardControl(ACR122U) nie powiodło się (0x{rc & 0xFFFFFFFF:08X}).")
 
         class _SCardIoRequest(ctypes.Structure):
             _fields_ = [("dwProtocol", ctypes.c_uint32), ("cbPciLength", ctypes.c_uint32)]
 
-        pci = _SCardIoRequest(self._active_protocol or 2, ctypes.sizeof(_SCardIoRequest))
-        recv_len = ctypes.c_uint32(512)
-        rc = int(
-            api.SCardTransmit(
-                self._card,
-                ctypes.byref(pci),
-                send_buf,
-                len(apdu),
-                None,
-                recv_buf,
-                ctypes.byref(recv_len),
+        for attempt in range(2):
+            pci = _SCardIoRequest(self._active_protocol or 2, ctypes.sizeof(_SCardIoRequest))
+            recv_len = ctypes.c_uint32(512)
+            rc = int(
+                api.SCardTransmit(
+                    self._card,
+                    ctypes.byref(pci),
+                    send_buf,
+                    len(apdu),
+                    None,
+                    recv_buf,
+                    ctypes.byref(recv_len),
+                )
             )
-        )
-        if rc != 0:
-            raise TransportError(f"SCardTransmit(ACR122U) nie powiodło się (0x{rc & 0xFFFFFFFF:08X}).")
-        return bytes(recv_buf[: int(recv_len.value)])
+            if rc == 0:
+                return bytes(recv_buf[: int(recv_len.value)])
+            rc_u32 = rc & 0xFFFFFFFF
+            if rc_u32 in _SCARD_NO_CARD_ERRORS:
+                raise NoSmartCardError("Brak karty lub tagu na czytniku ACR122U.")
+            if rc_u32 == _SCARD_W_RESET_CARD and attempt == 0:
+                self._reconnect_shared(api)
+                continue
+            raise TransportError(f"SCardTransmit(ACR122U) nie powiodło się (0x{rc_u32:08X}).")
+        raise TransportError("SCardTransmit(ACR122U) nie powiodło się.")
 
 
 class LinuxPcscTransport(_BasePcscTransport):
