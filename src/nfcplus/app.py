@@ -80,6 +80,22 @@ APDU_TEMPLATES: dict[str, str] = {
 }
 
 
+def format_connection_status(
+    dev_info: DeviceInfo,
+    display_name: str,
+    *,
+    supports_lf: bool,
+) -> str:
+    """Buduje tekst paska statusu połączenia z backendem i trybem pasma czytnika."""
+    backend = getattr(dev_info, "backend", "") or ""
+    backend_suffix = f" ({backend})" if backend else ""
+    band_suffix = "" if supports_lf else " | tylko 13,56 MHz"
+    return (
+        f"Status: Połączono{backend_suffix} | "
+        f"{dev_info.vid_pid} ({dev_info.path}) | {display_name}{band_suffix}"
+    )
+
+
 def _enable_windows_dpi_awareness() -> None:
     """Włącza skalowanie HiDPI oraz AppUserModelID w systemie Windows przed inicjalizacją okna."""
     if sys.platform != "win32":
@@ -1220,9 +1236,21 @@ class NFCPlusApp(ctk.CTk):
 
     def _require_reader(self) -> NFCReader | None:
         if self._reader is None:
-            messagebox.showwarning("Brak połączenia", "Najpierw połącz się z czytnikiem USB HID.")
+            messagebox.showwarning("Brak połączenia", "Najpierw połącz się z czytnikiem.")
             return None
         return self._reader
+
+    def _require_lf_reader(self) -> NFCReader | None:
+        reader = self._require_reader()
+        if reader is None:
+            return None
+        if not reader.supports_lf:
+            messagebox.showinfo(
+                "Brak obsługi 125 kHz",
+                "Połączony czytnik obsługuje wyłącznie pasmo 13,56 MHz (brak cewki 125 kHz / HID Prox).",
+            )
+            return None
+        return reader
 
     def _run_async(self, label: str, fn: Callable[[], None]) -> None:
         if self._busy:
@@ -1275,7 +1303,7 @@ class NFCPlusApp(ctk.CTk):
             if self._reader is None:
                 self.conn_info_var.set(f"Status: Brak czytnika — {hint}")
             self._log(
-                f"Nie wykryto kompatybilnego czytnika USB HID (0416:b030/b031, 2518:6018/6022). {hint}"
+                f"Nie wykryto kompatybilnego czytnika (0416:b030/b031, 2518:6018/6022, 072f:2200). {hint}"
             )
 
     def _on_toggle_auto_connect(self) -> None:
@@ -1298,9 +1326,18 @@ class NFCPlusApp(ctk.CTk):
         self.device_fw_var.set(fw)
         self.device_sn_var.set(sn)
         self.conn_info_var.set(
-            f"Status: Połączono | {dev_info.vid_pid} ({dev_info.path}) | {info['display_name']}"
+            format_connection_status(
+                dev_info,
+                info["display_name"],
+                supports_lf=reader.supports_lf,
+            )
         )
-        self._log(f"Połączono z: {info['display_name']} (Device: {fw}, SN: {sn})")
+        backend = getattr(dev_info, "backend", "") or ""
+        backend_note = f", backend: {backend}" if backend else ""
+        band_note = "" if reader.supports_lf else ", tylko 13,56 MHz"
+        self._log(
+            f"Połączono z: {info['display_name']} (Device: {fw}, SN: {sn}{backend_note}{band_note})"
+        )
 
     def _try_auto_connect(self) -> None:
         if self._reader is not None or self._busy or not self._devices or not self.auto_connect_var.get():
@@ -1410,10 +1447,24 @@ class NFCPlusApp(ctk.CTk):
 
         self._run_async("Skanowanie karty...", task)
 
+    def _clear_lf_vars(self) -> None:
+        for var in (
+            self.em_hex_var,
+            self.em_dec_var,
+            self.em_wg_var,
+            self.hid_format_var,
+            self.hid_fc_var,
+            self.hid_cn_var,
+            self.hid_raw_var,
+            self.hid_short_var,
+        ):
+            var.set("—")
+
     def _do_scan_all(self) -> None:
         reader = self._require_reader()
         if reader is None:
             return
+        supports_lf = reader.supports_lf
         try:
             freq = self._parse_lf_freq()
         except ValueError:
@@ -1421,16 +1472,35 @@ class NFCPlusApp(ctk.CTk):
 
         def task() -> None:
             iso_card = reader.scan_card(init_rf=True)
-            em_card = reader.read_em4100(freq_hz=freq, init_rf=True)
-            hid_card = reader.read_hid_prox(init_rf=True)
-
-            if iso_card is None and em_card is None and hid_card is None:
-                self.after(0, lambda: self._log("Brak karty na czytniku (13.56 MHz / 125 kHz / HID)."))
+            if supports_lf:
+                em_card = reader.read_em4100(freq_hz=freq, init_rf=True)
+                hid_card = reader.read_hid_prox(init_rf=True)
+            else:
+                em_card = None
+                hid_card = None
+                self.after(0, self._clear_lf_vars)
                 self.after(
                     0,
-                    lambda: messagebox.showinfo(
-                        "Brak karty", "Nie wykryto karty 13.56 MHz, 125 kHz (EM4100) ani HID Prox."
+                    lambda: self._log(
+                        "Czytnik obsługuje wyłącznie pasmo 13,56 MHz — pominięto 125 kHz."
                     ),
+                )
+
+            if iso_card is None and em_card is None and hid_card is None:
+                log_msg = (
+                    "Brak karty na czytniku (13.56 MHz / 125 kHz / HID)."
+                    if supports_lf
+                    else "Brak karty na czytniku (13.56 MHz)."
+                )
+                info_msg = (
+                    "Nie wykryto karty 13.56 MHz, 125 kHz (EM4100) ani HID Prox."
+                    if supports_lf
+                    else "Nie wykryto karty 13.56 MHz."
+                )
+                self.after(0, lambda m=log_msg: self._log(m))
+                self.after(
+                    0,
+                    lambda m=info_msg: messagebox.showinfo("Brak karty", m),
                 )
                 return
 
@@ -2453,7 +2523,7 @@ class NFCPlusApp(ctk.CTk):
         )
 
     def _do_read_em4100(self) -> None:
-        reader = self._require_reader()
+        reader = self._require_lf_reader()
         if reader is None:
             return
         try:
@@ -2474,7 +2544,7 @@ class NFCPlusApp(ctk.CTk):
         self._run_async("Odczyt 125 kHz (EM4100)...", task)
 
     def _do_read_hid_prox(self) -> None:
-        reader = self._require_reader()
+        reader = self._require_lf_reader()
         if reader is None:
             return
 
@@ -2490,7 +2560,7 @@ class NFCPlusApp(ctk.CTk):
         self._run_async("Odczyt HID Prox...", task)
 
     def _do_scan_lf_both(self) -> None:
-        reader = self._require_reader()
+        reader = self._require_lf_reader()
         if reader is None:
             return
         try:
@@ -2535,7 +2605,7 @@ class NFCPlusApp(ctk.CTk):
         self.conv_result_var.set(format_em4100_conversion_text(card))
 
     def _do_write_t5577(self) -> None:
-        reader = self._require_reader()
+        reader = self._require_lf_reader()
         if reader is None:
             return
         try:

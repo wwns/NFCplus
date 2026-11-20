@@ -37,7 +37,7 @@ def test_udev_rules_hardened_permissions() -> None:
     rules_path = Path(__file__).resolve().parent.parent / "udev" / "99-nfcplus.rules"
     text = rules_path.read_text(encoding="utf-8")
     assert 'MODE="0666"' not in text
-    assert text.count('MODE="0660", GROUP="plugdev", TAG+="uaccess"') == 8
+    assert text.count('MODE="0660", GROUP="plugdev", TAG+="uaccess"') == 9
 
 
 def test_audit_mifare_dump_default_keys_block0_bcc_sak_and_dual_lf() -> None:

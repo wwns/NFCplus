@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import select
+import struct
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ SUPPORTED_USB_IDS: tuple[tuple[int, int], ...] = (
     (0x2518, 0x6018),
 )
 
+SUPPORTED_CCID_IDS: dict[tuple[int, int], str] = {
+    (0x072F, 0x2200): "ACS ACR122U PICC Interface",
+}
+
 
 class TransportError(RuntimeError):
     """Błąd komunikacji z urządzeniem USB HID."""
@@ -25,7 +30,7 @@ class TransportError(RuntimeError):
 
 @dataclass(frozen=True)
 class DeviceInfo:
-    """Metadane wykrytego czytnika USB HID."""
+    """Metadane wykrytego czytnika USB HID lub CCID (ACR122U)."""
 
     vid: int
     pid: int
@@ -34,6 +39,8 @@ class DeviceInfo:
     manufacturer: str = ""
     serial: str = ""
     backend: str = ""
+    protocol_family: str = "wcopy_hid"
+    supports_lf: bool = True
 
     @property
     def vid_pid(self) -> str:
@@ -44,7 +51,9 @@ def format_reader_label(dev: DeviceInfo, *, duplicate_index: int | None = None) 
     """Formatuje czytelną nazwę czytnika dla UI bez surowej ścieżki \\\\?\\hid#..."""
     product = dev.product.strip() if dev.product else ""
     if not product:
-        if dev.vid == 0x0416 and dev.pid in (0xB030, 0xB031):
+        if (dev.vid, dev.pid) in SUPPORTED_CCID_IDS:
+            product = SUPPORTED_CCID_IDS[(dev.vid, dev.pid)]
+        elif dev.vid == 0x0416 and dev.pid in (0xB030, 0xB031):
             product = "XIXEI Smart Reader"
         elif dev.vid == 0x2518:
             product = "wCopy NFC Reader"
@@ -91,6 +100,20 @@ class HIDTransport(ABC):
     @abstractmethod
     def is_open(self) -> bool:
         """Zwraca True, jeśli urządzenie jest otwarte."""
+
+    @property
+    def protocol_family(self) -> str:
+        """Rodzina protokołu czytnika ('wcopy_hid' lub 'acr122u')."""
+        return "wcopy_hid"
+
+    @property
+    def supports_lf(self) -> bool:
+        """Czy czytnik obsługuje pasmo 125 kHz LF (EM4100 / HID Prox / T5577)."""
+        return True
+
+    def apdu_exchange(self, apdu: bytes, timeout_ms: int = 2000) -> bytes:
+        """Wysyła komendę APDU/pseudo-APDU (dla czytników CCID/PC-SC takich jak ACR122U)."""
+        raise NotImplementedError("Ten transport nie obsługuje bezpośredniej wymiany APDU CCID/PC/SC.")
 
     def __enter__(self) -> HIDTransport:
         self.open()
@@ -894,7 +917,7 @@ def _enumerate_hidapi(usb_ids: Iterable[tuple[int, int]]) -> list[DeviceInfo]:
 
 
 def enumerate_readers(usb_ids: Iterable[tuple[int, int]] = SUPPORTED_USB_IDS) -> list[DeviceInfo]:
-    """Zwraca listę wykrytych czytników NFC kompatybilnych z protokołem wCopy/Xixei."""
+    """Zwraca listę wykrytych czytników NFC (wCopy/Xixei HID oraz ACS ACR122U CCID/PC-SC)."""
     ids = tuple(usb_ids)
     devices = _enumerate_hidapi(ids)
     if sys.platform == "win32":
@@ -904,12 +927,23 @@ def enumerate_readers(usb_ids: Iterable[tuple[int, int]] = SUPPORTED_USB_IDS) ->
             if key not in seen:
                 seen.add(key)
                 devices.append(win_dev)
+        for pcsc_dev in _enumerate_windows_pcsc():
+            key = pcsc_dev.path.casefold()
+            if key not in seen:
+                seen.add(key)
+                devices.append(pcsc_dev)
         return devices
-    if devices:
-        return devices
+
+    if not devices and sys.platform.startswith("linux"):
+        devices = _enumerate_linux_hidraw(ids)
+
     if sys.platform.startswith("linux"):
-        return _enumerate_linux_hidraw(ids)
-    return []
+        pcsc_devs = _enumerate_linux_pcsc()
+        if pcsc_devs:
+            devices.extend(pcsc_devs)
+        else:
+            devices.extend(_enumerate_linux_usb_ccid())
+    return devices
 
 
 def _create_transport_for_device(dev: DeviceInfo) -> HIDTransport:
@@ -917,6 +951,12 @@ def _create_transport_for_device(dev: DeviceInfo) -> HIDTransport:
         return LinuxHidrawTransport(dev.path)
     if dev.backend == "win32":
         return WindowsHidTransport(dev.path)
+    if dev.backend == "winscard":
+        return WindowsPcscTransport(dev.path)
+    if dev.backend == "pcsc":
+        return LinuxPcscTransport(dev.path)
+    if dev.backend == "ccid_usb":
+        return LinuxUsbCcidTransport(dev.path, product=dev.product or "ACS ACR122U PICC Interface")
     return HidApiTransport(dev.path)
 
 
@@ -925,7 +965,7 @@ def open_reader(
     pid: int | None = None,
     path: str | None = None,
 ) -> tuple[DeviceInfo, HIDTransport]:
-    """Wyszukuje i otwiera pierwszy pasujący czytnik USB HID."""
+    """Wyszukuje i otwiera pierwszy pasujący czytnik USB HID lub ACR122U."""
     if path is not None:
         matched = next(
             (
@@ -935,18 +975,52 @@ def open_reader(
             ),
             None,
         )
+        if matched is not None:
+            transport = _create_transport_for_device(matched)
+            transport.open()
+            return matched, transport
+
         if path.startswith("/dev/hidraw"):
-            info = matched or DeviceInfo(vid=vid or 0, pid=pid or 0, path=path, backend="hidraw")
-            transport: HIDTransport = LinuxHidrawTransport(path)
-        elif sys.platform == "win32":
-            info = matched or DeviceInfo(vid=vid or 0, pid=pid or 0, path=path, backend="win32")
-            transport = (
-                HidApiTransport(path)
-                if matched is not None and matched.backend == "hidapi"
-                else WindowsHidTransport(path)
+            info = DeviceInfo(vid=vid or 0, pid=pid or 0, path=path, backend="hidraw")
+            transport = LinuxHidrawTransport(path)
+        elif path.startswith("/dev/bus/usb/"):
+            info = DeviceInfo(
+                vid=vid or 0x072F,
+                pid=pid or 0x2200,
+                path=path,
+                product="ACS ACR122U PICC Interface",
+                backend="ccid_usb",
+                protocol_family="acr122u",
+                supports_lf=False,
             )
+            transport = LinuxUsbCcidTransport(path)
+        elif sys.platform == "win32" and _is_acr122_reader_name(path):
+            info = DeviceInfo(
+                vid=vid or 0x072F,
+                pid=pid or 0x2200,
+                path=path,
+                product=path,
+                backend="winscard",
+                protocol_family="acr122u",
+                supports_lf=False,
+            )
+            transport = WindowsPcscTransport(path)
+        elif sys.platform == "win32":
+            info = DeviceInfo(vid=vid or 0, pid=pid or 0, path=path, backend="win32")
+            transport = WindowsHidTransport(path)
+        elif sys.platform.startswith("linux") and _is_acr122_reader_name(path):
+            info = DeviceInfo(
+                vid=vid or 0x072F,
+                pid=pid or 0x2200,
+                path=path,
+                product=path,
+                backend="pcsc",
+                protocol_family="acr122u",
+                supports_lf=False,
+            )
+            transport = LinuxPcscTransport(path)
         else:
-            info = matched or DeviceInfo(vid=vid or 0, pid=pid or 0, path=path, backend="manual")
+            info = DeviceInfo(vid=vid or 0, pid=pid or 0, path=path, backend="manual")
             transport = HidApiTransport(path)
         transport.open()
         return info, transport
@@ -962,11 +1036,661 @@ def open_reader(
         return dev, transport
 
     if not candidates:
-        supported_str = ", ".join(f"{v:04x}:{p:04x}" for v, p in SUPPORTED_USB_IDS)
+        all_ids = SUPPORTED_USB_IDS + tuple(SUPPORTED_CCID_IDS.keys())
+        supported_str = ", ".join(f"{v:04x}:{p:04x}" for v, p in all_ids)
         raise TransportError(
-            f"Nie znaleziono żadnego kompatybilnego czytnika USB HID ({supported_str}). "
+            f"Nie znaleziono żadnego kompatybilnego czytnika USB HID/CCID ({supported_str}). "
             f"{no_readers_hint()}"
         )
     raise TransportError(
         f"Nie znaleziono czytnika pasującego do filtru VID={vid} PID={pid}. {no_readers_hint()}"
     )
+
+
+# ------------------------------------------------------------------
+# Obsługa ACS ACR122U (072f:2200) — PC/SC (Windows/Linux) + Linux USB CCID
+# ------------------------------------------------------------------
+
+_SCARD_SCOPE_USER = 0
+_SCARD_SHARE_SHARED = 2
+_SCARD_SHARE_DIRECT = 3
+_SCARD_LEAVE_CARD = 0
+_SCARD_PROTOCOL_TX = 0x0003
+_IOCTL_CCID_ESCAPE_WIN = 0x003136B0
+_IOCTL_CCID_ESCAPE_LINUX = 0x42000DAC
+_IOCTL_CCID_ALT_LINUX = 0x42000D48
+
+
+def _parse_pcsc_multi_string(raw: bytes, *, encoding: str) -> list[str]:
+    text = raw.decode(encoding, errors="replace")
+    names: list[str] = []
+    for part in text.split("\x00"):
+        cleaned = part.strip()
+        if not cleaned:
+            if names:
+                break
+            continue
+        names.append(cleaned)
+    return names
+
+
+def _is_acr122_reader_name(name: str) -> bool:
+    return "acr122" in name.lower()
+
+
+def _load_winscard_dll() -> Any:
+    if sys.platform != "win32":
+        raise TransportError("winscard.dll jest dostępny wyłącznie w systemie Windows.")
+    try:
+        return ctypes.WinDLL("winscard")  # type: ignore[attr-defined]
+    except (OSError, AttributeError) as exc:
+        raise TransportError(f"Nie można załadować winscard.dll: {exc}") from exc
+
+
+def _load_pcsclite_lib() -> Any:
+    for lib_name in ("libpcsclite.so.1", "libpcsclite.so"):
+        try:
+            return ctypes.CDLL(lib_name)
+        except OSError:
+            continue
+    raise TransportError("Brak biblioteki libpcsclite.so.1 w systemie.")
+
+
+class _BasePcscTransport(HIDTransport):
+    """Wspólna baza PC/SC dla Windows (`winscard.dll`) i Linuksa (`libpcsclite`)."""
+
+    def __init__(self, reader_name: str) -> None:
+        self._reader_name = reader_name
+        self._ctx: Any = None
+        self._card: Any = None
+        self._active_protocol: int = 0
+
+    @property
+    def product(self) -> str:
+        return self._reader_name
+
+    @property
+    def protocol_family(self) -> str:
+        return "acr122u"
+
+    @property
+    def supports_lf(self) -> bool:
+        return False
+
+    @property
+    def is_open(self) -> bool:
+        return self._card is not None
+
+    def write(self, data: bytes) -> int:
+        raise TransportError("Czytnik ACR122U używa apdu_exchange(), nie surowych raportów HID 64 B.")
+
+    def read(self, size: int = 64, timeout_ms: int = 2000) -> bytes:
+        raise TransportError("Czytnik ACR122U używa apdu_exchange(), nie surowych raportów HID 64 B.")
+
+
+class WindowsPcscTransport(_BasePcscTransport):
+    """Natywny backend PC/SC dla Windowsa (`winscard.dll`, zero zależności pip)."""
+
+    def __init__(self, reader_name: str, *, dll: Any | None = None) -> None:
+        super().__init__(reader_name)
+        self._dll = dll
+
+    def _api(self) -> Any:
+        if self._dll is None:
+            self._dll = _load_winscard_dll()
+        return self._dll
+
+    def open(self) -> None:
+        if self._card is not None:
+            return
+        api = self._api()
+        ctx = ctypes.c_void_p()
+        rc = int(api.SCardEstablishContext(_SCARD_SCOPE_USER, None, None, ctypes.byref(ctx)))
+        if rc != 0:
+            raise TransportError(f"SCardEstablishContext nie powiodło się (0x{rc & 0xFFFFFFFF:08X}).")
+
+        card = ctypes.c_void_p()
+        proto = ctypes.c_uint32(0)
+        rc = int(
+            api.SCardConnectW(
+                ctx,
+                self._reader_name,
+                _SCARD_SHARE_DIRECT,
+                0,
+                ctypes.byref(card),
+                ctypes.byref(proto),
+            )
+        )
+        if rc != 0:
+            rc = int(
+                api.SCardConnectW(
+                    ctx,
+                    self._reader_name,
+                    _SCARD_SHARE_SHARED,
+                    _SCARD_PROTOCOL_TX,
+                    ctypes.byref(card),
+                    ctypes.byref(proto),
+                )
+            )
+        if rc != 0:
+            api.SCardReleaseContext(ctx)
+            raise TransportError(
+                f"SCardConnectW('{self._reader_name}') nie powiodło się (0x{rc & 0xFFFFFFFF:08X})."
+            )
+        self._ctx = ctx
+        self._card = card
+        self._active_protocol = int(proto.value)
+
+    def close(self) -> None:
+        if self._dll is not None:
+            if self._card is not None:
+                try:
+                    self._dll.SCardDisconnect(self._card, _SCARD_LEAVE_CARD)
+                except Exception:
+                    pass
+                self._card = None
+            if self._ctx is not None:
+                try:
+                    self._dll.SCardReleaseContext(self._ctx)
+                except Exception:
+                    pass
+                self._ctx = None
+        self._active_protocol = 0
+
+    def apdu_exchange(self, apdu: bytes, timeout_ms: int = 2000) -> bytes:
+        if self._card is None:
+            raise TransportError("Czytnik ACR122U (PC/SC) nie jest otwarty.")
+        api = self._api()
+        send_buf = (ctypes.c_ubyte * len(apdu))(*apdu)
+        recv_buf = (ctypes.c_ubyte * 512)()
+        recv_len = ctypes.c_uint32(512)
+
+        if self._active_protocol == 0 or apdu[:2] == b"\xff\x00":
+            rc = int(
+                api.SCardControl(
+                    self._card,
+                    _IOCTL_CCID_ESCAPE_WIN,
+                    send_buf,
+                    len(apdu),
+                    recv_buf,
+                    len(recv_buf),
+                    ctypes.byref(recv_len),
+                )
+            )
+            if rc == 0:
+                return bytes(recv_buf[: int(recv_len.value)])
+            if self._active_protocol == 0:
+                raise TransportError(f"SCardControl(ACR122U) nie powiodło się (0x{rc & 0xFFFFFFFF:08X}).")
+
+        class _SCardIoRequest(ctypes.Structure):
+            _fields_ = [("dwProtocol", ctypes.c_uint32), ("cbPciLength", ctypes.c_uint32)]
+
+        pci = _SCardIoRequest(self._active_protocol or 2, ctypes.sizeof(_SCardIoRequest))
+        recv_len = ctypes.c_uint32(512)
+        rc = int(
+            api.SCardTransmit(
+                self._card,
+                ctypes.byref(pci),
+                send_buf,
+                len(apdu),
+                None,
+                recv_buf,
+                ctypes.byref(recv_len),
+            )
+        )
+        if rc != 0:
+            raise TransportError(f"SCardTransmit(ACR122U) nie powiodło się (0x{rc & 0xFFFFFFFF:08X}).")
+        return bytes(recv_buf[: int(recv_len.value)])
+
+
+class LinuxPcscTransport(_BasePcscTransport):
+    """Backend PC/SC dla Linuksa (`libpcsclite.so.1`, jeśli `pcscd` działa)."""
+
+    def __init__(self, reader_name: str, *, lib: Any | None = None) -> None:
+        super().__init__(reader_name)
+        self._lib = lib
+
+    def _api(self) -> Any:
+        if self._lib is None:
+            self._lib = _load_pcsclite_lib()
+        return self._lib
+
+    def open(self) -> None:
+        if self._card is not None:
+            return
+        api = self._api()
+        ctx = ctypes.c_long(0)
+        rc = int(api.SCardEstablishContext(_SCARD_SCOPE_USER, None, None, ctypes.byref(ctx)))
+        if rc != 0:
+            raise TransportError(f"SCardEstablishContext (pcsclite) błąd 0x{rc & 0xFFFFFFFF:08X}.")
+
+        card = ctypes.c_long(0)
+        proto = ctypes.c_ulong(0)
+        name_bytes = self._reader_name.encode("utf-8")
+        rc = int(
+            api.SCardConnect(
+                ctx,
+                name_bytes,
+                _SCARD_SHARE_DIRECT,
+                0,
+                ctypes.byref(card),
+                ctypes.byref(proto),
+            )
+        )
+        if rc != 0:
+            rc = int(
+                api.SCardConnect(
+                    ctx,
+                    name_bytes,
+                    _SCARD_SHARE_SHARED,
+                    _SCARD_PROTOCOL_TX,
+                    ctypes.byref(card),
+                    ctypes.byref(proto),
+                )
+            )
+        if rc != 0:
+            api.SCardReleaseContext(ctx)
+            raise TransportError(f"SCardConnect('{self._reader_name}') błąd 0x{rc & 0xFFFFFFFF:08X}.")
+        self._ctx = ctx
+        self._card = card
+        self._active_protocol = int(proto.value)
+
+    def close(self) -> None:
+        if self._lib is not None:
+            if self._card is not None:
+                try:
+                    self._lib.SCardDisconnect(self._card, _SCARD_LEAVE_CARD)
+                except Exception:
+                    pass
+                self._card = None
+            if self._ctx is not None:
+                try:
+                    self._lib.SCardReleaseContext(self._ctx)
+                except Exception:
+                    pass
+                self._ctx = None
+        self._active_protocol = 0
+
+    def apdu_exchange(self, apdu: bytes, timeout_ms: int = 2000) -> bytes:
+        if self._card is None:
+            raise TransportError("Czytnik ACR122U (PC/SC) nie jest otwarty.")
+        api = self._api()
+        send_buf = (ctypes.c_ubyte * len(apdu))(*apdu)
+        recv_buf = (ctypes.c_ubyte * 512)()
+        recv_len = ctypes.c_ulong(0)
+
+        if self._active_protocol == 0 or apdu[:2] == b"\xff\x00":
+            for ctl in (_IOCTL_CCID_ESCAPE_LINUX, _IOCTL_CCID_ALT_LINUX):
+                recv_len = ctypes.c_ulong(0)
+                rc = int(
+                    api.SCardControl(
+                        self._card,
+                        ctl,
+                        send_buf,
+                        len(apdu),
+                        recv_buf,
+                        len(recv_buf),
+                        ctypes.byref(recv_len),
+                    )
+                )
+                if rc == 0:
+                    return bytes(recv_buf[: int(recv_len.value)])
+            if self._active_protocol == 0:
+                raise TransportError(f"SCardControl (pcsclite) błąd 0x{rc & 0xFFFFFFFF:08X}.")
+
+        class _PcscIoRequest(ctypes.Structure):
+            _fields_ = [("dwProtocol", ctypes.c_ulong), ("cbPciLength", ctypes.c_ulong)]
+
+        pci = _PcscIoRequest(self._active_protocol or 2, ctypes.sizeof(_PcscIoRequest))
+        recv_len = ctypes.c_ulong(len(recv_buf))
+        rc = int(
+            api.SCardTransmit(
+                self._card,
+                ctypes.byref(pci),
+                send_buf,
+                len(apdu),
+                None,
+                recv_buf,
+                ctypes.byref(recv_len),
+            )
+        )
+        if rc != 0:
+            raise TransportError(f"SCardTransmit (pcsclite) błąd 0x{rc & 0xFFFFFFFF:08X}.")
+        return bytes(recv_buf[: int(recv_len.value)])
+
+
+class _UsbdevfsBulkTransfer(ctypes.Structure):
+    _fields_ = [
+        ("ep", ctypes.c_uint),
+        ("len", ctypes.c_uint),
+        ("timeout", ctypes.c_uint),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+class _UsbdevfsIoctl(ctypes.Structure):
+    _fields_ = [
+        ("ifno", ctypes.c_int),
+        ("ioctl_code", ctypes.c_int),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+def _iowr(kind: str, nr: int, size: int) -> int:
+    return (3 << 30) | (size << 16) | (ord(kind) << 8) | nr
+
+
+def _ior(kind: str, nr: int, size: int) -> int:
+    return (2 << 30) | (size << 16) | (ord(kind) << 8) | nr
+
+
+_USBDEVFS_BULK = _iowr("U", 2, ctypes.sizeof(_UsbdevfsBulkTransfer))
+_USBDEVFS_CLAIMINTERFACE = _ior("U", 15, ctypes.sizeof(ctypes.c_uint))
+_USBDEVFS_RELEASEINTERFACE = _ior("U", 16, ctypes.sizeof(ctypes.c_uint))
+_USBDEVFS_IOCTL = _iowr("U", 18, ctypes.sizeof(_UsbdevfsIoctl))
+_USBDEVFS_DISCONNECT = (ord("U") << 8) | 22
+
+
+def _build_ccid_frame(msg_type: int, seq: int, payload: bytes = b"", param0: int = 0, param1: int = 0) -> bytes:
+    """Buduje 10-bajtowy nagłówek CCID + ładunek."""
+    return struct.pack("<BIBBBH", msg_type & 0xFF, len(payload), 0, seq & 0xFF, param0 & 0xFF, param1 & 0xFFFF) + payload
+
+
+def _parse_ccid_frame(raw: bytes) -> tuple[int, int, int, int, bytes]:
+    """Dekoduje 10-bajtową odpowiedź CCID: (msg_type, seq, status, error, payload)."""
+    if len(raw) < 10:
+        raise TransportError(f"Za krótka odpowiedź CCID ({len(raw)} B).")
+    msg_type, dw_len, _slot, seq, b_status, b_error, _param = struct.unpack("<BIBBBBB", raw[:10])
+    payload = raw[10 : 10 + dw_len]
+    return msg_type, seq, b_status, b_error, payload
+
+
+class LinuxUsbCcidTransport(HIDTransport):
+    """Bezpośredni backend Linux USB CCID (`USBDEVFS_*` na `/dev/bus/usb/BBB/DDD`, bez pyusb/libusb)."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        ep_out: int = 0x02,
+        ep_in: int = 0x82,
+        interface_num: int = 0,
+        product: str = "ACS ACR122U PICC Interface",
+        ioctl_fn: Any | None = None,
+    ) -> None:
+        self._path = path
+        self._ep_out = ep_out
+        self._ep_in = ep_in
+        self._interface_num = interface_num
+        self._product = product
+        self._fd: int | None = None
+        self._seq = 0
+        self._ioctl_fn = ioctl_fn
+
+    @property
+    def product(self) -> str:
+        return self._product
+
+    @property
+    def protocol_family(self) -> str:
+        return "acr122u"
+
+    @property
+    def supports_lf(self) -> bool:
+        return False
+
+    @property
+    def is_open(self) -> bool:
+        return self._fd is not None
+
+    def _next_seq(self) -> int:
+        seq = self._seq
+        self._seq = (self._seq + 1) & 0xFF
+        return seq
+
+    def _do_ioctl(self, fd: int, request: int, arg: Any) -> int:
+        if self._ioctl_fn is not None:
+            return int(self._ioctl_fn(fd, request, arg))
+        import fcntl
+
+        return int(fcntl.ioctl(fd, request, arg))
+
+    def _bulk_transfer(self, ep: int, data: bytes | int, timeout_ms: int) -> bytes:
+        if self._fd is None:
+            raise TransportError("Urządzenie USB CCID nie jest otwarte.")
+        if isinstance(data, int):
+            buf = (ctypes.c_ubyte * data)()
+            length = data
+        else:
+            buf = (ctypes.c_ubyte * len(data))(*data)
+            length = len(data)
+        xfer = _UsbdevfsBulkTransfer(
+            ep=ep,
+            len=length,
+            timeout=max(100, timeout_ms),
+            data=ctypes.cast(buf, ctypes.c_void_p).value,
+        )
+        nbytes = self._do_ioctl(self._fd, _USBDEVFS_BULK, xfer)
+        if isinstance(data, int):
+            return bytes(buf[:nbytes])
+        return data[:nbytes]
+
+    def open(self) -> None:
+        if self._fd is not None:
+            return
+        try:
+            fd = os.open(self._path, os.O_RDWR)
+        except PermissionError as exc:
+            raise TransportError(
+                f"Brak uprawnień zapisu do {self._path}. Zainstaluj regułę udev z pliku udev/99-nfcplus.rules."
+            ) from exc
+        except OSError as exc:
+            raise TransportError(f"Nie można otworzyć {self._path}: {exc}") from exc
+
+        self._fd = fd
+        try:
+            # Odłącz sterownik jądra (np. pn533_usb) od interfejsu 0, jeśli jest podpięty.
+            disc = _UsbdevfsIoctl(ifno=self._interface_num, ioctl_code=_USBDEVFS_DISCONNECT, data=0)
+            try:
+                self._do_ioctl(fd, _USBDEVFS_IOCTL, disc)
+            except OSError:
+                pass
+
+            iface = ctypes.c_uint(self._interface_num)
+            try:
+                self._do_ioctl(fd, _USBDEVFS_CLAIMINTERFACE, iface)
+            except OSError as exc:
+                if getattr(exc, "errno", None) == 16:  # EBUSY
+                    raise TransportError(
+                        f"Interfejs USB {self._path} jest zajęty (np. przez sterownik jądra pn533_usb lub pcscd): {exc}"
+                    ) from exc
+                raise TransportError(f"Nie można zająć interfejsu USB CCID ({self._path}): {exc}") from exc
+
+            # PC_to_RDR_IccPowerOn (0x62): inicjalizacja slotu CCID (ignorujemy błąd braku karty).
+            try:
+                self._ccid_exchange(0x62, b"", timeout_ms=500, ignore_card_absent=True)
+            except TransportError:
+                pass
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._fd is not None:
+            try:
+                iface = ctypes.c_uint(self._interface_num)
+                self._do_ioctl(self._fd, _USBDEVFS_RELEASEINTERFACE, iface)
+            except Exception:
+                pass
+            try:
+                os.close(self._fd)
+            finally:
+                self._fd = None
+
+    def _ccid_exchange(
+        self,
+        msg_type: int,
+        payload: bytes,
+        *,
+        timeout_ms: int = 2000,
+        ignore_card_absent: bool = False,
+    ) -> bytes:
+        seq = self._next_seq()
+        packet = _build_ccid_frame(msg_type, seq, payload)
+        self._bulk_transfer(self._ep_out, packet, timeout_ms)
+
+        while True:
+            raw = self._bulk_transfer(self._ep_in, 512, timeout_ms)
+            _r_type, _r_seq, b_status, b_error, resp_payload = _parse_ccid_frame(raw)
+            cmd_status = (b_status >> 6) & 0x03
+            if cmd_status == 0x02:  # CCID Time Extension
+                continue
+            if cmd_status != 0x00:
+                if ignore_card_absent and b_error in (0xFE, 0xFF):
+                    return b""
+                raise TransportError(f"Błąd CCID ACR122U (status=0x{b_status:02X}, error=0x{b_error:02X}).")
+            return resp_payload
+
+    def apdu_exchange(self, apdu: bytes, timeout_ms: int = 2000) -> bytes:
+        return self._ccid_exchange(0x6F, apdu, timeout_ms=timeout_ms)
+
+    def write(self, data: bytes) -> int:
+        raise TransportError("Czytnik ACR122U używa apdu_exchange(), nie surowych raportów HID 64 B.")
+
+    def read(self, size: int = 64, timeout_ms: int = 2000) -> bytes:
+        raise TransportError("Czytnik ACR122U używa apdu_exchange(), nie surowych raportów HID 64 B.")
+
+
+def _enumerate_windows_pcsc() -> list[DeviceInfo]:
+    if sys.platform != "win32":
+        return []
+    try:
+        api = _load_winscard_dll()
+    except TransportError:
+        return []
+
+    ctx = ctypes.c_void_p()
+    if int(api.SCardEstablishContext(_SCARD_SCOPE_USER, None, None, ctypes.byref(ctx))) != 0:
+        return []
+    try:
+        ch_len = ctypes.c_uint32(0)
+        rc = int(api.SCardListReadersW(ctx, None, None, ctypes.byref(ch_len)))
+        if rc != 0 or ch_len.value == 0:
+            return []
+        buf = (ctypes.c_wchar * int(ch_len.value))()
+        if int(api.SCardListReadersW(ctx, None, buf, ctypes.byref(ch_len))) != 0:
+            return []
+        names = _parse_pcsc_multi_string(bytes(buf), encoding="utf-16-le")
+    finally:
+        api.SCardReleaseContext(ctx)
+
+    return [
+        DeviceInfo(
+            vid=0x072F,
+            pid=0x2200,
+            path=name,
+            product=name,
+            manufacturer="ACS",
+            backend="winscard",
+            protocol_family="acr122u",
+            supports_lf=False,
+        )
+        for name in names
+        if _is_acr122_reader_name(name)
+    ]
+
+
+def _enumerate_linux_pcsc() -> list[DeviceInfo]:
+    if not sys.platform.startswith("linux"):
+        return []
+    try:
+        api = _load_pcsclite_lib()
+    except TransportError:
+        return []
+
+    ctx = ctypes.c_long(0)
+    if int(api.SCardEstablishContext(_SCARD_SCOPE_USER, None, None, ctypes.byref(ctx))) != 0:
+        return []
+    try:
+        ch_len = ctypes.c_ulong(0)
+        rc = int(api.SCardListReaders(ctx, None, None, ctypes.byref(ch_len)))
+        if rc != 0 or ch_len.value == 0:
+            return []
+        buf = ctypes.create_string_buffer(int(ch_len.value))
+        if int(api.SCardListReaders(ctx, None, buf, ctypes.byref(ch_len))) != 0:
+            return []
+        names = _parse_pcsc_multi_string(buf.raw, encoding="utf-8")
+    finally:
+        api.SCardReleaseContext(ctx)
+
+    return [
+        DeviceInfo(
+            vid=0x072F,
+            pid=0x2200,
+            path=name,
+            product=name,
+            manufacturer="ACS",
+            backend="pcsc",
+            protocol_family="acr122u",
+            supports_lf=False,
+        )
+        for name in names
+        if _is_acr122_reader_name(name)
+    ]
+
+
+def _enumerate_linux_usb_ccid(
+    ccid_ids: dict[tuple[int, int], str] | None = None,
+    sysfs_root: Path = Path("/sys/bus/usb/devices"),
+) -> list[DeviceInfo]:
+    """Wykrywa czytniki CCID (np. ACS ACR122U 072f:2200) przez Linux sysfs (`/sys/bus/usb/devices`)."""
+    allowed = ccid_ids if ccid_ids is not None else SUPPORTED_CCID_IDS
+    found: list[DeviceInfo] = []
+    if not sysfs_root.exists():
+        return found
+
+    for entry in sorted(sysfs_root.iterdir()):
+        if ":" in entry.name:
+            continue
+        vid_file = entry / "idVendor"
+        pid_file = entry / "idProduct"
+        bus_file = entry / "busnum"
+        dev_file = entry / "devnum"
+        if not (vid_file.is_file() and pid_file.is_file() and bus_file.is_file() and dev_file.is_file()):
+            continue
+        try:
+            vid = int(vid_file.read_text(encoding="utf-8").strip(), 16)
+            pid = int(pid_file.read_text(encoding="utf-8").strip(), 16)
+            busnum = int(bus_file.read_text(encoding="utf-8").strip(), 10)
+            devnum = int(dev_file.read_text(encoding="utf-8").strip(), 10)
+        except (OSError, ValueError):
+            continue
+        if (vid, pid) not in allowed:
+            continue
+
+        def _read_opt(name: str) -> str:
+            p = entry / name
+            if p.is_file():
+                try:
+                    return p.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    return ""
+            return ""
+
+        product = _read_opt("product") or allowed[(vid, pid)]
+        manufacturer = _read_opt("manufacturer")
+        serial = _read_opt("serial")
+        found.append(
+            DeviceInfo(
+                vid=vid,
+                pid=pid,
+                path=f"/dev/bus/usb/{busnum:03d}/{devnum:03d}",
+                product=product,
+                manufacturer=manufacturer,
+                serial=serial,
+                backend="ccid_usb",
+                protocol_family="acr122u",
+                supports_lf=False,
+            )
+        )
+    return found

@@ -591,14 +591,39 @@ class NFCReader:
     # Komendy natywne czytnika
     # ------------------------------------------------------------------
 
+    @property
+    def transport(self) -> HIDTransport:
+        return self._transport
+
+    @property
+    def protocol_family(self) -> str:
+        return str(getattr(self._transport, "protocol_family", "wcopy_hid"))
+
+    @property
+    def is_acr122u(self) -> bool:
+        return self.protocol_family == "acr122u"
+
+    @property
+    def supports_lf(self) -> bool:
+        return bool(getattr(self._transport, "supports_lf", True))
+
+    def _require_lf_support(self) -> None:
+        if not self.supports_lf:
+            raise ProtocolError("Czytnik ACR122U obsługuje wyłącznie pasmo 13,56 MHz (brak cewki 125 kHz).")
+
     def get_firmware_version(self) -> str:
-        """Pobiera wersję firmware komendą FF 00 68."""
+        """Pobiera wersję firmware (FF 00 68 dla wCopy lub FF 00 48 00 00 dla ACR122U)."""
+        if self.is_acr122u:
+            resp = self._transport.apdu_exchange(b"\xff\x00\x48\x00\x00", timeout_ms=self._timeout_ms)
+            return resp.rstrip(b"\x00").decode("ascii", errors="replace").strip()
         # Nowsze warianty firmware (np. NSR122-HID V901N1) zwracają ramki 0x02...0xFD także dla komend natywnych.
         resp = self.exchange_raw(b"\xff\x00\x68", expected_start=(START_NATIVE, START_PN532))
         return resp.rstrip(b"\x00").decode("ascii", errors="replace").strip()
 
     def get_model_name(self) -> str:
-        """Pobiera nazwę modelu komendą FF 00 69."""
+        """Pobiera nazwę modelu (FF 00 69 dla wCopy lub nazwę produktu dla ACR122U)."""
+        if self.is_acr122u:
+            return str(getattr(self._transport, "product", "") or "ACS ACR122U PICC Interface")
         resp = self.exchange_raw(b"\xff\x00\x69", expected_start=(START_NATIVE, START_PN532))
         return resp.rstrip(b"\x00").decode("ascii", errors="replace").strip()
 
@@ -613,10 +638,19 @@ class NFCReader:
     def beep(self, duration_ms: int = 50) -> None:
         """Uruchamia brzęczyk czytnika na podany czas (w ms)."""
         dur = max(1, (duration_ms // 10) & 0xFF)
+        if self.is_acr122u:
+            resp = self._transport.apdu_exchange(
+                bytes([0xFF, 0x00, 0x40, 0x00, 0x04, dur, 0x00, 0x01, 0x01]),
+                timeout_ms=self._timeout_ms,
+            )
+            # ACR122U zwraca 90 <LED_STATE> (bit 0 = czerwony, bit 1 = zielony), np. 90 00..90 03.
+            if len(resp) < 2 or resp[-2] != 0x90:
+                raise ProtocolError(f"Błąd brzęczyka ACR122U: {resp.hex(' ')}")
+            return
         self.exchange_raw(bytes([0xFF, 0x00, 0x40, 0x50, 0x04, dur, 0x01, 0x01, 0x01]))
 
     # ------------------------------------------------------------------
-    # Tunel PN532-over-HID
+    # Tunel PN532-over-HID / PN532-over-ACR122U
     # ------------------------------------------------------------------
 
     def pn532_command(self, cmd: bytes) -> bytes:
@@ -624,6 +658,17 @@ class NFCReader:
         if not cmd:
             raise ValueError("Komenda PN532 nie może być pusta.")
         tunnel_payload = bytes([0xFF, 0x00, 0x00, 0x00, len(cmd) + 1, PN532_HOST_TO_CHIP]) + cmd
+        if self.is_acr122u:
+            resp = self._transport.apdu_exchange(tunnel_payload, timeout_ms=self._timeout_ms)
+            if len(resp) < 2:
+                raise ProtocolError(f"Za krótka odpowiedź tunelu ACR122U: {resp.hex(' ')}")
+            if resp[-2:] != b"\x90\x00":
+                raise ProtocolError(f"Błąd statusu ACR122U: {resp[-2:].hex(' ').upper()}")
+            inner = resp[:-2]
+            if len(inner) < 2 or inner[0] != PN532_CHIP_TO_HOST or inner[1] != ((cmd[0] + 1) & 0xFF):
+                raise ProtocolError(f"Nieprawidłowa odpowiedź PN532 z ACR122U: {resp.hex(' ')}")
+            return inner[2:]
+
         resp = self.exchange_raw(tunnel_payload, expected_start=START_PN532)
         if len(resp) < 2 or resp[0] != PN532_CHIP_TO_HOST or resp[1] != ((cmd[0] + 1) & 0xFF):
             raise ProtocolError(f"Nieprawidłowa odpowiedź tunelu PN532: {resp.hex(' ')}")
@@ -632,6 +677,10 @@ class NFCReader:
     def read_register(self, reg: int) -> int:
         """Odczytuje pojedynczy rejestr PN532 (komenda 0x06)."""
         resp = self.pn532_command(bytes([0x06, (reg >> 8) & 0xFF, reg & 0xFF]))
+        if self.is_acr122u:
+            if len(resp) == 1 or (len(resp) == 3 and resp[1:] == b"\x90\x00"):
+                return resp[0]
+            raise ProtocolError(f"Błąd odczytu rejestru 0x{reg:04X}: {resp.hex(' ')}")
         if len(resp) != 3 or resp[1:] != b"\x90\x00":
             raise ProtocolError(f"Błąd odczytu rejestru 0x{reg:04X}: {resp.hex(' ')}")
         return resp[0]
@@ -647,7 +696,8 @@ class NFCReader:
             new_val = value & 0xFF
 
         resp = self.pn532_command(bytes([0x08, (reg >> 8) & 0xFF, reg & 0xFF, new_val]))
-        if resp != b"\x90\x00":
+        valid = (b"", b"\x90\x00") if self.is_acr122u else (b"\x90\x00",)
+        if resp not in valid:
             raise ProtocolError(f"Błąd zapisu rejestru 0x{reg:04X}: {resp.hex(' ')}")
 
     def set_rf_field(self, enabled: bool) -> None:
@@ -764,6 +814,12 @@ class NFCReader:
     def mifare_read_block(self, block: int) -> bytes:
         """Odczytuje 16-bajtowy blok Mifare Classic (0x30)."""
         resp = self.pn532_command(bytes([0x40, 0x01, 0x30, block & 0xFF]))
+        if self.is_acr122u:
+            if len(resp) == 17 and resp[0] == 0x00:
+                return resp[1:17]
+            if len(resp) == 19 and resp[0] == 0x00 and resp[-2:] == b"\x90\x00":
+                return resp[1:17]
+            raise ProtocolError(f"Błąd odczytu bloku {block}: {resp.hex(' ')}")
         if len(resp) != 19 or resp[0] != 0x00 or resp[-2:] != b"\x90\x00":
             raise ProtocolError(f"Błąd odczytu bloku {block}: {resp.hex(' ')}")
         return resp[1:17]
@@ -773,7 +829,8 @@ class NFCReader:
         if len(data) != 16:
             raise ValueError("Blok Mifare Classic musi mieć dokładnie 16 bajtów.")
         resp = self.pn532_command(bytes([0x40, 0x01, 0xA0, block & 0xFF]) + data)
-        if resp != b"\x00\x90\x00":
+        valid = (b"\x00", b"\x00\x90\x00") if self.is_acr122u else (b"\x00\x90\x00",)
+        if resp not in valid:
             raise ProtocolError(f"Błąd zapisu bloku {block}: {resp.hex(' ')}")
 
     def _authenticate_mifare_sector(
@@ -1020,11 +1077,20 @@ class NFCReader:
     # ------------------------------------------------------------------
 
     def ntag_get_version(self) -> NtagVersion:
-        """Odczytuje wersję układu NTAG / Ultralight EV1 (komenda 0x62)."""
-        resp = self.pn532_command(b"\x40\x01\x62")
-        if len(resp) not in (12, 14) or resp[0] != 0x00 or resp[1] != 0x50 or resp[-2:] != b"\x90\x00":
-            raise ProtocolError(f"Karta nie obsługuje polecenia GET_VERSION NTAG: {resp.hex(' ')}")
-        ver = resp[2:10]
+        """Odczytuje wersję układu NTAG / Ultralight EV1 (0x60 na ACR122U lub 0x62 w wCopy)."""
+        if self.is_acr122u:
+            resp = self.pn532_command(b"\x40\x01\x60")
+            if len(resp) == 9 and resp[0] == 0x00:
+                ver = resp[1:9]
+            elif len(resp) in (12, 14) and resp[0] == 0x00 and resp[1] == 0x50 and resp[-2:] == b"\x90\x00":
+                ver = resp[2:10]
+            else:
+                raise ProtocolError(f"Karta nie obsługuje polecenia GET_VERSION NTAG: {resp.hex(' ')}")
+        else:
+            resp = self.pn532_command(b"\x40\x01\x62")
+            if len(resp) not in (12, 14) or resp[0] != 0x00 or resp[1] != 0x50 or resp[-2:] != b"\x90\x00":
+                raise ProtocolError(f"Karta nie obsługuje polecenia GET_VERSION NTAG: {resp.hex(' ')}")
+            ver = resp[2:10]
         storage_code = ver[6]
         name, pages, total_bytes = NTAG_STORAGE_MAP.get(
             storage_code, (f"Nieznany NTAG/UL (0x{storage_code:02X})", 45, 180)
@@ -1034,6 +1100,10 @@ class NFCReader:
     def ntag_read_page(self, page: int) -> bytes:
         """Odczytuje pojedynczą 4-bajtową stronę NTAG przez FAST_READ (0x3A)."""
         resp = self.pn532_command(bytes([0x40, 0x01, 0x3A, page & 0xFF, page & 0xFF]))
+        if self.is_acr122u:
+            if len(resp) < 5 or resp[0] != 0x00:
+                raise ProtocolError(f"Błąd odczytu strony {page}: {resp.hex(' ')}")
+            return resp[1:5]
         if len(resp) < 7 or resp[0] != 0x00 or resp[-2:] != b"\x90\x00":
             raise ProtocolError(f"Błąd odczytu strony {page}: {resp.hex(' ')}")
         page_data = resp[1:5]
@@ -1111,7 +1181,8 @@ class NFCReader:
         if password is not None:
             self.ntag_pwd_auth(password)
         resp = self.pn532_command(bytes([0x40, 0x01, 0xA2, page & 0xFF]) + data)
-        if resp != b"\x00\x90\x00":
+        valid = (b"\x00", b"\x00\x90\x00") if self.is_acr122u else (b"\x00\x90\x00",)
+        if resp not in valid:
             raise ProtocolError(f"Błąd zapisu strony {page}: {resp.hex(' ')}")
 
     def ntag_write_user_memory(
@@ -1206,6 +1277,7 @@ class NFCReader:
         init_rf: bool = True,
     ) -> EM4100Card:
         """Zapisuje 5-bajtowy identyfikator EM4100 na czysty transponder T5577 (FF 00 66 00 1E ...)."""
+        self._require_lf_support()
         block0, block1, block2 = encode_em4100_t5577_blocks(id5)
         if init_rf:
             self.init_rf()
@@ -1233,6 +1305,7 @@ class NFCReader:
         init_rf: bool = True,
     ) -> HIDProxCard:
         """Zapisuje 6-bajtowy identyfikator HID Prox na czysty transponder T5577 (FF 00 66 00 1E ...)."""
+        self._require_lf_support()
         block0, block1, block2, block3 = encode_hid_t5577_blocks(raw6)
         if init_rf:
             self.init_rf()
@@ -1265,6 +1338,7 @@ class NFCReader:
 
     def read_em4100(self, freq_hz: int = DEFAULT_LF_FREQ_HZ, init_rf: bool = True) -> EM4100Card | None:
         """Odczytuje kartę 125 kHz EM4100 / T5577 komendą FF 00 65 05 1E <freq_le32> 00 00 00 00."""
+        self._require_lf_support()
         if freq_hz <= 0 or freq_hz > 0xFFFFFFFF:
             raise ValueError(f"Nieprawidłowa częstotliwość 125 kHz: {freq_hz}")
         if init_rf:
@@ -1298,6 +1372,7 @@ class NFCReader:
         retry_delay_s: float = 0.01,
     ) -> HIDProxCard | None:
         """Odczytuje kartę HID Prox (26–37 bitów) komendą FF 00 6A 01 00 08 z weryfikacją powtórną."""
+        self._require_lf_support()
         if init_rf:
             self.init_rf()
         first = self._read_hid_prox_once(retries=retries, retry_delay_s=retry_delay_s)

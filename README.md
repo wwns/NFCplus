@@ -1,12 +1,18 @@
 # NFCplus
 
-Czytelny, działający w pełni lokalnie (offline) sterownik oraz klient GUI + CLI dla czytników USB HID z rodziny **wCopy / Xixei / NFC Pro** (obsługiwane VID:PID: `0416:b030`, `0416:b031`, `2518:6022`, `2518:6018`).
+Czytelny, działający w pełni lokalnie (offline) sterownik oraz klient GUI + CLI dla czytników:
+- **wCopy / Xixei / NFC Pro** (USB HID, `13,56 MHz` + `125 kHz` / HID Prox — VID:PID: `0416:b030`, `0416:b031`, `2518:6022`, `2518:6018`),
+- **ACS ACR122U** (`072f:2200`, tryb `PC/SC` lub bezpośredni `USB CCID`, wyłącznie pasmo `13,56 MHz`).
 
 Protokół został wyodrębniony z oryginalnej binarki [nfcPro_x64.exe](nfcPro_x64.exe) i opisany w [docs/protocol.md](docs/protocol.md). Program obsługuje wyłącznie standardową komunikację z czytnikiem (bez funkcji sieciowych i bez modułów ataków kryptograficznych).
 
 ## Uruchomienie na Linuksie
 
-Na Linuksie aplikacja korzysta z wbudowanego backendu `/dev/hidraw*` (nie wymaga zewnętrznych bibliotek do komunikacji z czytnikiem).
+Na Linuksie aplikacja korzysta z wbudowanego backendu `/dev/hidraw*` dla czytników **wCopy / Xixei / NFC Pro** (nie wymaga zewnętrznych bibliotek do komunikacji z czytnikiem).
+
+Dla czytnika **ACS ACR122U (`072f:2200`)** obsługiwane są dwa warianty komunikacji:
+- **PC/SC (`pcscd` + `libpcsclite.so.1`):** jeśli usługa `pcscd` jest uruchomiona, aplikacja korzysta z niej bezpośrednio bez dodatkowych pakietów Pythona.
+- **Bezpośredni USB CCID (`/dev/bus/usb/*/*`):** wbudowany backend `ccid_usb` działa bez `pcscd` po nadaniu uprawnień regułą `udev/99-nfcplus.rules` (uwaga: jeśli jądro załaduje moduł `pn533_usb` / `pn533` blokujący interfejs USB, odłącz go przez `sudo modprobe -r pn533_usb pn533` lub użyj usługi `pcscd`).
 
 1. (Jednorazowo) nadaj bezpieczne uprawnienia dla zalogowanego użytkownika lokalnego (`MODE="0660", GROUP="plugdev", TAG+="uaccess"`) przez `udev`:
    ```bash
@@ -58,7 +64,11 @@ Na Linuksie aplikacja korzysta z wbudowanego backendu `/dev/hidraw*` (nie wymaga
 
 ## Uruchomienie na Windowsie
 
-Na Windowsie komunikacja z czytnikiem działa **bez dodatkowych sterowników USB** (wbudowany `WindowsHidTransport` korzysta bezpośrednio z Win32 API `setupapi.dll`, `hid.dll`, `kernel32.dll` przez `ctypes`). Jedyną wymaganą zależnością interfejsu graficznego jest `customtkinter>=5.2` (instalowana automatycznie przez `pip install -e .` lub skrypt `run_windows.bat`).
+Na Windowsie komunikacja z czytnikiem działa **bez dodatkowych sterowników ani pakietów USB/PC/SC**:
+- dla czytników **wCopy / Xixei / NFC Pro** wbudowany `WindowsHidTransport` korzysta bezpośrednio z Win32 API (`setupapi.dll`, `hid.dll`, `kernel32.dll` przez `ctypes`),
+- dla **ACS ACR122U (`072f:2200`)** wbudowany `WindowsPcscTransport` korzysta bezpośrednio z systemowej biblioteki `winscard.dll` (`PC/SC`) — czytnik obsługuje wyłącznie pasmo `13,56 MHz` (operacje `125 kHz` / HID Prox są automatycznie pomijane lub informują o braku cewki LF).
+
+Jedyną wymaganą zależnością interfejsu graficznego jest `customtkinter>=5.2` (instalowana automatycznie przez `pip install -e .` lub skrypt `run_windows.bat`).
 
 ### Szybkie uruchomienie i diagnostyka
 

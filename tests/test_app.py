@@ -18,6 +18,7 @@ from nfcplus.app import (
     block_hex_to_utf8_text,
     format_apdu_exchange_entry,
     format_audit_status_banner,
+    format_connection_status,
     format_em4100_conversion_text,
     format_mifare_analysis,
     format_mifare_dump_text,
@@ -348,4 +349,118 @@ def test_block_hex_utf8_sync_and_live_block_preview() -> None:
     assert "Blok 002:" in preview
     assert "Blok 003: [TRAILER — pominięty]" in preview
     assert "Blok 004:" in preview
+
+
+def test_acr122u_connection_status_lf_guard_and_scan_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acr_dev = DeviceInfo(
+        vid=0x072F,
+        pid=0x2200,
+        path="/dev/bus/usb/001/003",
+        product="ACR122U PICC Interface",
+        backend="ccid_usb",
+        protocol_family="acr122u",
+        supports_lf=False,
+    )
+    status_acr = format_connection_status(acr_dev, "ACR122U PICC Interface", supports_lf=False)
+    assert "(ccid_usb)" in status_acr
+    assert "072f:2200" in status_acr
+    assert "tylko 13,56 MHz" in status_acr
+
+    wcopy_dev = DeviceInfo(
+        vid=0x0416,
+        pid=0xB030,
+        path="/dev/hidraw0",
+        product="wCopy",
+        backend="hidraw",
+        protocol_family="wcopy_hid",
+        supports_lf=True,
+    )
+    status_wcopy = format_connection_status(wcopy_dev, "wCopy", supports_lf=True)
+    assert "(hidraw)" in status_wcopy
+    assert "tylko 13,56 MHz" not in status_wcopy
+
+    # _require_lf_reader zwraca None i pokazuje messagebox.showinfo dla czytnika bez LF
+    info_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        app_mod.messagebox,
+        "showinfo",
+        lambda title, msg: info_calls.append((title, msg)),
+    )
+
+    lf_calls: list[str] = []
+    fake_iso_card = SimpleNamespace(uid_hex="3F 99 06 63", card_type="MIFARE Classic 1K")
+    fake_reader = SimpleNamespace(
+        supports_lf=False,
+        scan_card=lambda init_rf=True: fake_iso_card,
+        read_em4100=lambda **_kw: lf_calls.append("read_em4100"),
+        read_hid_prox=lambda **_kw: lf_calls.append("read_hid_prox"),
+        beep=lambda _ms: None,
+    )
+
+    def make_var(initial: str = "STARE") -> SimpleNamespace:
+        state = {"val": initial}
+        return SimpleNamespace(
+            set=lambda v: state.__setitem__("val", v),
+            get=lambda: state["val"],
+        )
+
+    scheduled: list[object] = []
+    logs: list[str] = []
+    applied_iso: list[object] = []
+    fake_app = SimpleNamespace(
+        _reader=fake_reader,
+        _require_reader=lambda: fake_reader,
+        _require_lf_reader=lambda: NFCPlusApp._require_lf_reader(fake_app),  # type: ignore[arg-type]
+        _parse_lf_freq=lambda: 125_000,
+        _clear_lf_vars=lambda: NFCPlusApp._clear_lf_vars(fake_app),  # type: ignore[arg-type]
+        _apply_card_vars=lambda c: applied_iso.append(c),
+        _log=lambda msg: logs.append(msg),
+        after=lambda _ms, cb: scheduled.append(cb),
+        _run_async=lambda _lbl, fn: fn(),
+        em_hex_var=make_var(),
+        em_dec_var=make_var(),
+        em_wg_var=make_var(),
+        hid_format_var=make_var(),
+        hid_fc_var=make_var(),
+        hid_cn_var=make_var(),
+        hid_raw_var=make_var(),
+        hid_short_var=make_var(),
+    )
+
+    assert NFCPlusApp._require_lf_reader(fake_app) is None  # type: ignore[arg-type]
+    assert len(info_calls) == 1
+    assert "13,56 MHz" in info_calls[0][1]
+
+    for lf_method in (
+        NFCPlusApp._do_read_em4100,
+        NFCPlusApp._do_read_hid_prox,
+        NFCPlusApp._do_scan_lf_both,
+        NFCPlusApp._do_write_t5577,
+    ):
+        lf_method(fake_app)  # type: ignore[arg-type]
+    assert lf_calls == []
+
+    # _do_scan_all dla ACR122U pomija LF, czyści pola LF i loguje komunikat
+    NFCPlusApp._do_scan_all(fake_app)  # type: ignore[arg-type]
+    for cb in scheduled:
+        cb()  # type: ignore[operator]
+
+    assert lf_calls == []
+    assert applied_iso == [fake_iso_card]
+    assert any("wyłącznie pasmo 13,56 MHz" in msg for msg in logs)
+    assert all(
+        var.get() == "—"
+        for var in (
+            fake_app.em_hex_var,
+            fake_app.em_dec_var,
+            fake_app.em_wg_var,
+            fake_app.hid_format_var,
+            fake_app.hid_fc_var,
+            fake_app.hid_cn_var,
+            fake_app.hid_raw_var,
+            fake_app.hid_short_var,
+        )
+    )
 

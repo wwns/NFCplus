@@ -660,10 +660,17 @@ def audit_live_reader(
 ) -> CardAuditReport:
     """Wykonuje w 100% nieinwazyjny (Read-Only) audyt karty umieszczonej na czytniku."""
     iso_card = reader.scan_card(init_rf=True)
-    em_card = reader.read_em4100(init_rf=True)
-    hid_card = reader.read_hid_prox(init_rf=True)
+    supports_lf = bool(getattr(reader, "supports_lf", True))
+    if supports_lf:
+        em_card = reader.read_em4100(init_rf=True)
+        hid_card = reader.read_hid_prox(init_rf=True)
+    else:
+        em_card = None
+        hid_card = None
 
     if iso_card is None and em_card is None and hid_card is None:
+        if not supports_lf:
+            raise ProtocolError("Nie wykryto żadnej karty 13,56 MHz na czytniku.")
         raise ProtocolError("Nie wykryto żadnej karty na czytniku (13.56 MHz / 125 kHz / HID).")
 
     if iso_card is not None:
@@ -681,24 +688,30 @@ def audit_live_reader(
                 atqa=card_m.atqa_hex,
                 sak=f"{card_m.sak:02X}",
             )
-            return audit_mifare_dump(
+            rep = audit_mifare_dump(
                 dump,
                 found_keys=found,
                 card=card_m,
                 em4100=em_card,
                 hid_prox=hid_card,
             )
+            if not supports_lf:
+                rep.card_metadata["supports_lf"] = False
+            return rep
 
         if iso_card.sak == 0x00:
             card_n, version, pages = reader.ntag_read_all()
             dump_n = NtagDump.from_pages(pages)
-            return audit_ntag_dump(
+            rep = audit_ntag_dump(
                 dump_n,
                 version=version,
                 card=card_n,
                 em4100=em_card,
                 hid_prox=hid_card,
             )
+            if not supports_lf:
+                rep.card_metadata["supports_lf"] = False
+            return rep
 
         # Karta ISO 14443-4 (DESFire / CPU / Mifare Plus)
         findings: list[AuditFinding] = []
@@ -708,6 +721,8 @@ def audit_live_reader(
             "atqa": iso_card.atqa_hex,
             "sak": f"{iso_card.sak:02X}",
         }
+        if not supports_lf:
+            metadata["supports_lf"] = False
         _add_lf_findings(findings, metadata, em_card, hid_card)
         if len(iso_card.uid) == 4 and iso_card.uid[0] == 0x08:
             findings.append(

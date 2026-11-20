@@ -151,8 +151,12 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             return 0
 
         iso_card = reader.scan_card(init_rf=True)
-        em_card = reader.read_em4100(init_rf=True)
-        hid_card = reader.read_hid_prox(init_rf=True)
+        if reader.supports_lf:
+            em_card = reader.read_em4100(init_rf=True)
+            hid_card = reader.read_hid_prox(init_rf=True)
+        else:
+            em_card = None
+            hid_card = None
 
         if iso_card is None and em_card is None and hid_card is None:
             print("Brak karty na czytniku (13.56 MHz / 125 kHz / HID).")

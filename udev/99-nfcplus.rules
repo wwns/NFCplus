@@ -12,3 +12,6 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="b030", MODE="0660"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="b031", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="2518", ATTRS{idProduct}=="6022", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="2518", ATTRS{idProduct}=="6018", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# ACS ACR122U (USB CCID, 13.56 MHz)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="072f", ATTRS{idProduct}=="2200", MODE="0660", GROUP="plugdev", TAG+="uaccess"
