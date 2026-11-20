@@ -48,7 +48,7 @@ Na Linuksie aplikacja korzysta z wbudowanego backendu `/dev/hidraw*` (nie wymaga
 - **Zakładka `2. Mifare Classic`:**
   - import własnych list kluczy **`.txt` / `.dic`** (`parse_key_file`) ze scalaniem bez duplikatów,
   - wizualna **siatka statusu kluczy A / B per sektor** (dopasowana do trybu ciemnego i jasnego: zielony = OK, czerwony = błąd / brak klucza, szary = niesprawdzono),
-  - wczytywanie `.dump` / `.bin` do bufora, eksport do **JSON** (`save_json`), **analizator uprawnień (`Access Bits`) i bloków `Value Block`**, **edycja bloków w buforze** z walidacją `C1/C2/C3`,
+  - wczytywanie `.dump` / `.bin` do bufora, eksport do **JSON** (`save_json`), **analizator uprawnień (`Access Bits`) i bloków `Value Block`**, **edycja bloków w buforze** z walidacją `C1/C2/C3` oraz **zapis tekstu UTF-8 przez bloki danych** (automatycznie z pominięciem Bloku 0 i trailerów sektorów),
   - **zapis całego zrzutu na kartę** (domyślnie bez Bloku 0; zapis Bloku 0 wymaga potwierdzenia dla kart CUID/Gen2) oraz **bezpieczne formatowanie karty** (zerowanie danych bez Bloku 0 i przywrócenie `FFFFFFFFFFFF / FF078069 / FFFFFFFFFFFF`).
 - **Zakładka `3. NTAG / Ultralight`:** `Info o tagu (Get Version)`, opcjonalna autoryzacja hasłem **`PWD_AUTH`** (`4 B` hex), odczyt i zapis stron/zrzutów, automatyczne dekodowanie **NDEF** (`URI` / `Text`) oraz formularz zapisu rekordów **NDEF** od strony 4.
 - **Zakładka `4. Zrzuty (.dump)`:** podgląd plików `.dump` / `.bin` oraz **porównywarka dwóch zrzutów obok siebie** (lewy + prawy panel i lista różnic `compare_buffers`).
@@ -100,17 +100,17 @@ Dostępne są także polecenia CLI:
 .venv\Scripts\pip install -e ".[hid]"
 ```
 
-### Budowanie samodzielnego pliku `NFCplus.exe` (lokalnie lub przez GitHub Actions)
+### Budowanie pliku `NFCplus.exe` i instalatora `NFCplus-Setup` (lokalnie lub przez GitHub Actions)
 
 Lokalnie na Windowsie:
 ```bat
 py -3 -m pip install -e ".[build]"
 build_windows.bat
 ```
-Gotowy plik powstanie w `dist\NFCplus.exe`.
+Gotowy plik powstanie w `dist\NFCplus.exe` (a jeśli w `PATH` dostępny jest **NSIS** `makensis`, również instalator `dist\NFCplus-Setup-v0.1.0.exe`).
 
 Automatycznie w chmurze (**GitHub Actions**):
-- Workflow [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml) na maszynie `windows-latest` uruchamia zestaw testów `pytest -v`, buduje jednoplikowy `dist\NFCplus.exe` przez PyInstaller (`--onefile --windowed --collect-all customtkinter`) i publikuje go jako artefakt **`NFCplus-Windows-x64`** przy każdym `push`, `pull_request` lub ręcznym uruchomieniu (`workflow_dispatch`).
+- Workflow [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml) na maszynie `windows-latest` uruchamia zestaw testów `pytest -v`, buduje jednoplikowy `dist\NFCplus.exe` (z ikoną `assets\nfcplus.ico`), kompiluje instalator **NSIS** (`dist\NFCplus-Setup-v*.exe`), pakuje `NFCplus-Windows-x64.zip` i publikuje je jako artefakt **`NFCplus-Windows-x64`** oraz w **GitHub Releases** dla tagów `v*` / `workflow_dispatch`.
 
 > **Wskazówka (Windows):** Jeśli program zgłasza błąd otwarcia czytnika (`odmowa dostępu` / `zajęty`), zamknij inne otwarte narzędzia korzystające z czytnika (np. `wCopy` lub `nfcPro_x64.exe`) i sprawdź obecność urządzenia w **Menedżerze urządzeń → Urządzenia interfejsu HID**.
 

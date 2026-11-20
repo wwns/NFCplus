@@ -14,10 +14,13 @@ from .dump import (
     DumpDiff,
     MifareDump,
     NtagDump,
+    decode_blocks_to_text,
     decode_value_block,
+    encode_text_to_blocks,
     parse_access_bits,
     parse_key_file,
     validate_access_bits,
+    writable_data_blocks,
 )
 from .ndef import (
     NDEF_URI_PREFIXES,
@@ -47,6 +50,8 @@ from .transport import (
     HIDTransport,
     TransportError,
     enumerate_readers,
+    format_reader_label,
+    format_reader_labels,
     open_reader,
 )
 
@@ -78,10 +83,14 @@ __all__ = [
     "build_ndef_text_tlv",
     "build_ndef_uri_tlv",
     "convert_em4100_formats",
+    "decode_blocks_to_text",
     "decode_em4100",
     "decode_hid_prox",
     "decode_value_block",
+    "encode_text_to_blocks",
     "enumerate_readers",
+    "format_reader_label",
+    "format_reader_labels",
     "mask_key_hex",
     "open_reader",
     "parse_access_bits",
@@ -90,4 +99,5 @@ __all__ = [
     "parse_ndef_tlv",
     "sector_auth_from_keys",
     "validate_access_bits",
+    "writable_data_blocks",
 ]

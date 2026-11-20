@@ -46,6 +46,9 @@ echo [NFCplus] Budowanie pliku wykonywalnego dist\NFCplus.exe ...
     --clean ^
     --onefile ^
     --windowed ^
+    --icon assets\nfcplus.ico ^
+    --add-data "assets\nfcplus.ico;assets" ^
+    --add-data "assets\nfcplus.png;assets" ^
     --collect-all customtkinter ^
     --name NFCplus ^
     --paths src ^
@@ -55,6 +58,15 @@ if errorlevel 1 (
     echo [NFCplus] Budowanie nie powiodlo sie.
     pause
     exit /b %errorlevel%
+)
+
+where makensis >nul 2>&1
+if not errorlevel 1 (
+    echo [NFCplus] Budowanie instalatora NSIS ^(dist\NFCplus-Setup-v0.1.1.exe^)...
+    makensis installer\nfcplus.nsi
+    if errorlevel 1 (
+        echo [NFCplus] Ostrzezenie: budowanie instalatora NSIS nie powiodlo sie.
+    )
 )
 
 echo.

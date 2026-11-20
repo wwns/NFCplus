@@ -12,10 +12,13 @@ from nfcplus.dump import (
     MifareDump,
     NtagDump,
     compare_buffers,
+    decode_blocks_to_text,
     decode_value_block,
+    encode_text_to_blocks,
     parse_access_bits,
     parse_key_file,
     validate_access_bits,
+    writable_data_blocks,
 )
 
 
@@ -182,3 +185,36 @@ def test_decode_value_block_and_json_export(tmp_path: Path) -> None:
     assert s0["blocks"][1]["value_block"] == 42
     assert s0["blocks"][3]["is_trailer"] is True
     assert s0["blocks"][3]["value_block"] is None
+
+
+def test_mifare_text_block_encoding_decoding_and_write_text() -> None:
+    blocks_1k = writable_data_blocks(64)
+    assert len(blocks_1k) == 47  # 2 (S0) + 15 * 3
+    assert 0 not in blocks_1k
+    assert all(blk % 4 != 3 for blk in blocks_1k)
+
+    blocks_4k = writable_data_blocks(256)
+    assert len(blocks_4k) == 215  # 2 + 31*3 + 8*15
+    assert 143 not in blocks_4k  # trailer sektora 32 (128+15)
+
+    dump = MifareDump.empty(64)
+    for s in range(16):
+        dump.set_block(s * 4 + 3, FACTORY_MIFARE_TRAILER)
+    dump.set_block(0, b"\xaa" * 16)
+
+    long_text = "NFCplus test wieloblokowy: Zażółć gęślą jaźń — 1234567890!"
+    written = dump.write_text(long_text, start_block=1)
+    assert written == [1, 2, 4, 5, 6]  # pomija blok 0 oraz trailer 3
+    assert dump.get_block(0) == b"\xaa" * 16
+    assert dump.get_block(3) == FACTORY_MIFARE_TRAILER
+    assert decode_blocks_to_text(dump, start_block=1) == long_text
+
+    # clear_remaining=True czyści pozostałe bloki danych
+    dump.write_text("krótki", start_block=1, clear_remaining=True)
+    assert decode_blocks_to_text(dump, start_block=1) == "krótki"
+    assert dump.get_block(4) == b"\x00" * 16
+    assert dump.get_block(3) == FACTORY_MIFARE_TRAILER
+
+    # Przekroczenie pojemności dostępnych bloków danych
+    with pytest.raises(ValueError, match="przekracza pojemność"):
+        encode_text_to_blocks("X" * 800, 64, start_block=1)

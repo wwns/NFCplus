@@ -14,11 +14,13 @@ from nfcplus.app import (
     SECTOR_COLOR_UNKNOWN,
     SECTOR_COLOR_UNKNOWN_DARK,
     NFCPlusApp,
+    _find_asset_path,
     format_apdu_exchange_entry,
     format_audit_status_banner,
     format_em4100_conversion_text,
     format_mifare_analysis,
     format_mifare_dump_text,
+    format_mifare_text_capacity,
     format_ndef_records_text,
     format_write_report_summary,
     get_config_path,
@@ -273,4 +275,54 @@ def test_audit_gui_banner_and_mask_toggle_without_display() -> None:
     mask_state["val"] = False
     NFCPlusApp._on_audit_mask_changed(fake_app)  # type: ignore[arg-type]
     assert "FFFFFFFFFFFF" in rendered_texts[-1]
+
+
+def test_assets_text_capacity_and_clean_reader_labels_in_gui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _find_asset_path("nfcplus.ico") is not None
+    assert _find_asset_path("nfcplus.png") is not None
+    assert _find_asset_path("nonexistent_asset_xyz.ico") is None
+
+    # Symulacja trybu PyInstaller (_MEIPASS)
+    bundle_assets = tmp_path / "assets"
+    bundle_assets.mkdir()
+    fake_ico = bundle_assets / "nfcplus.ico"
+    fake_ico.write_bytes(b"ICO")
+    monkeypatch.setattr(app_mod.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert _find_asset_path("nfcplus.ico") == fake_ico
+
+    # Pojemność zapisu tekstu UTF-8 dla Mifare Classic 1K (64 bloki -> 47 bloków danych od bloku 1 = 752 B)
+    ub, mb, ublk, mblk = format_mifare_text_capacity(64, 1, "Ala ma kota")
+    assert ub == 11
+    assert mb == 752
+    assert ublk == 1
+    assert mblk == 47
+
+    # _refresh_devices używa czytelnych etykiet bez \\?\hid#...
+    win_dev = DeviceInfo(
+        vid=0x0416,
+        pid=0xB030,
+        path=r"\\?\hid#vid_0416&pid_b030#6&1234&0&0000#{4d1e55b2}",
+        product="NSCCN XIXEI Smart Reader",
+        backend="win32",
+    )
+    monkeypatch.setattr(app_mod, "enumerate_readers", lambda: [win_dev])
+    combo_values: list[list[str]] = []
+    combo_selected: list[str] = []
+    fake_app = SimpleNamespace(
+        _devices=[],
+        _device_labels=[],
+        _reader=None,
+        device_combo=SimpleNamespace(
+            configure=lambda **kw: combo_values.append(kw["values"]),
+            set=lambda val: combo_selected.append(val),
+        ),
+        conn_info_var=SimpleNamespace(set=lambda _v: None),
+        _log=lambda _m: None,
+    )
+    NFCPlusApp._refresh_devices(fake_app)  # type: ignore[arg-type]
+    assert combo_values == [["NSCCN XIXEI Smart Reader (0416:b030)"]]
+    assert combo_selected == ["NSCCN XIXEI Smart Reader (0416:b030)"]
+    assert r"\\?\hid#" not in combo_selected[0]
 

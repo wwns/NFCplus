@@ -9,7 +9,7 @@ import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 SUPPORTED_USB_IDS: tuple[tuple[int, int], ...] = (
     (0x0416, 0xB030),
@@ -38,6 +38,34 @@ class DeviceInfo:
     @property
     def vid_pid(self) -> str:
         return f"{self.vid:04x}:{self.pid:04x}"
+
+
+def format_reader_label(dev: DeviceInfo, *, duplicate_index: int | None = None) -> str:
+    """Formatuje czytelną nazwę czytnika dla UI bez surowej ścieżki \\\\?\\hid#..."""
+    product = dev.product.strip() if dev.product else ""
+    if not product:
+        if dev.vid == 0x0416 and dev.pid in (0xB030, 0xB031):
+            product = "XIXEI Smart Reader"
+        elif dev.vid == 0x2518:
+            product = "wCopy NFC Reader"
+        else:
+            product = "Czytnik USB HID"
+    label = f"{product} ({dev.vid_pid})"
+    if duplicate_index is not None and duplicate_index > 1:
+        return f"{label} #{duplicate_index}"
+    return label
+
+
+def format_reader_labels(devices: Sequence[DeviceInfo]) -> list[str]:
+    """Buduje listę unikalnych, czytelnych etykiet czytników (dopisując #2, #3 przy duplikatach)."""
+    counts: dict[str, int] = {}
+    labels: list[str] = []
+    for dev in devices:
+        base = format_reader_label(dev)
+        idx = counts.get(base, 0) + 1
+        counts[base] = idx
+        labels.append(format_reader_label(dev, duplicate_index=idx if idx > 1 else None))
+    return labels
 
 
 class HIDTransport(ABC):

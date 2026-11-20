@@ -485,3 +485,25 @@ def test_app_helpers_dpi_and_monospace_font(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(app_mod.tkfont, "families", lambda _root: ["Arial"])
     assert app_mod._select_monospace_font(object(), platform="win32") == "TkFixedFont"  # type: ignore[arg-type]
+
+
+def test_format_reader_labels_and_duplicates() -> None:
+    from nfcplus.transport import DeviceInfo, format_reader_label, format_reader_labels
+
+    d1 = DeviceInfo(vid=0x0416, pid=0xB030, path=r"\\?\hid#vid_0416&pid_b030#...", product="XIXEI Smart Reader")
+    d2 = DeviceInfo(vid=0x0416, pid=0xB030, path=r"\\?\hid#vid_0416&pid_b030#2", product="")
+    d3 = DeviceInfo(vid=0x2518, pid=0x6022, path=r"\\?\hid#vid_2518&pid_6022#...", product="")
+    d4 = DeviceInfo(vid=0x1234, pid=0x5678, path="/dev/hidraw9", product="")
+
+    assert format_reader_label(d1) == "XIXEI Smart Reader (0416:b030)"
+    assert "\\\\?\\hid" not in format_reader_label(d1)
+    assert format_reader_label(d2) == "XIXEI Smart Reader (0416:b030)"
+    assert format_reader_label(d3) == "wCopy NFC Reader (2518:6022)"
+    assert format_reader_label(d4) == "Czytnik USB HID (1234:5678)"
+
+    labels = format_reader_labels([d1, d2, d3])
+    assert labels == [
+        "XIXEI Smart Reader (0416:b030)",
+        "XIXEI Smart Reader (0416:b030) #2",
+        "wCopy NFC Reader (2518:6022)",
+    ]

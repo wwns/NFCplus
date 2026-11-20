@@ -260,6 +260,26 @@ class MifareDump:
     def compare(self, other: MifareDump) -> DumpDiff:
         return compare_buffers(bytes(self.data), bytes(other.data), MIFARE_BLOCK_SIZE)
 
+    def write_text(
+        self,
+        text: str,
+        start_block: int = 1,
+        *,
+        encoding: str = "utf-8",
+        clear_remaining: bool = False,
+    ) -> list[int]:
+        """Koduje tekst przez kolejne bloki danych (z pominięciem Bloku 0 i trailerów) i zwraca listę zapisanych bloków."""
+        block_map = encode_text_to_blocks(
+            text,
+            self.total_blocks,
+            start_block=start_block,
+            encoding=encoding,
+            clear_remaining=clear_remaining,
+        )
+        for blk, payload in block_map.items():
+            self.set_block(blk, payload)
+        return sorted(block_map.keys())
+
     def to_json_dict(
         self,
         *,
@@ -372,3 +392,78 @@ class NtagDump:
 
     def compare(self, other: NtagDump) -> DumpDiff:
         return compare_buffers(bytes(self.data), bytes(other.data), NTAG_PAGE_SIZE)
+
+
+def _is_mifare_trailer_index(block: int) -> bool:
+    if block < 128:
+        return block % 4 == 3
+    return (block - 128) % 16 == 15
+
+
+def writable_data_blocks(total_blocks: int, start_block: int = 1) -> list[int]:
+    """Zwraca listę indeksów bloków danych >= start_block z pominięciem Bloku 0 i trailerów sektorów."""
+    if total_blocks <= 0:
+        raise ValueError(f"Liczba bloków musi być dodatnia, podano {total_blocks}.")
+    if start_block < 0 or start_block >= total_blocks:
+        raise IndexError(f"Nieprawidłowy blok początkowy: {start_block}")
+    return [
+        blk
+        for blk in range(max(1, start_block), total_blocks)
+        if not _is_mifare_trailer_index(blk)
+    ]
+
+
+def encode_text_to_blocks(
+    text: str,
+    total_blocks: int,
+    start_block: int = 1,
+    *,
+    encoding: str = "utf-8",
+    pad_byte: int = 0x00,
+    clear_remaining: bool = False,
+) -> dict[int, bytes]:
+    """Koduje tekst na 16-bajtowe bloki danych Mifare Classic (bez Bloku 0 i trailerów)."""
+    if not 0 <= pad_byte <= 0xFF:
+        raise ValueError(f"Bajt dopełnienia musi być z zakresu 0..255, podano {pad_byte}.")
+    target_blocks = writable_data_blocks(total_blocks, start_block=start_block)
+    raw = text.encode(encoding)
+    capacity = len(target_blocks) * MIFARE_BLOCK_SIZE
+    if len(raw) > capacity:
+        raise ValueError(
+            f"Tekst ({len(raw)} B) przekracza pojemność dostępnych bloków danych ({capacity} B)."
+        )
+
+    pad_b = bytes([pad_byte])
+    chunks: list[bytes] = []
+    if raw:
+        for off in range(0, len(raw), MIFARE_BLOCK_SIZE):
+            chunk = raw[off : off + MIFARE_BLOCK_SIZE]
+            if len(chunk) < MIFARE_BLOCK_SIZE:
+                chunk = chunk + (pad_b * (MIFARE_BLOCK_SIZE - len(chunk)))
+            chunks.append(chunk)
+    elif target_blocks:
+        chunks.append(pad_b * MIFARE_BLOCK_SIZE)
+
+    result: dict[int, bytes] = {
+        target_blocks[idx]: chunk for idx, chunk in enumerate(chunks)
+    }
+    if clear_remaining:
+        zero_block = b"\x00" * MIFARE_BLOCK_SIZE
+        for blk in target_blocks[len(chunks) :]:
+            result[blk] = zero_block
+    return result
+
+
+def decode_blocks_to_text(
+    dump: MifareDump,
+    start_block: int = 1,
+    end_block: int | None = None,
+    *,
+    encoding: str = "utf-8",
+) -> str:
+    """Dekoduje tekst z kolejnych bloków danych Mifare Classic (pomijając Blok 0 i trailery)."""
+    blocks = writable_data_blocks(dump.total_blocks, start_block=start_block)
+    if end_block is not None:
+        blocks = [blk for blk in blocks if blk <= end_block]
+    raw = b"".join(dump.get_block(blk) for blk in blocks).rstrip(b"\x00")
+    return raw.decode(encoding, errors="replace")

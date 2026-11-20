@@ -27,10 +27,13 @@ from nfcplus.dump import (
     MifareDump,
     NtagDump,
     compare_buffers,
+    decode_blocks_to_text,
     decode_value_block,
+    encode_text_to_blocks,
     format_hex_ascii,
     parse_key_file,
     validate_access_bits,
+    writable_data_blocks,
 )
 from nfcplus.ndef import (
     NdefRecord,
@@ -58,6 +61,7 @@ from nfcplus.transport import (
     HIDTransport,
     TransportError,
     enumerate_readers,
+    format_reader_labels,
     no_readers_hint,
     open_reader,
 )
@@ -350,6 +354,29 @@ def format_em4100_conversion_text(card: EM4100Card) -> str:
     )
 
 
+def _find_asset_path(filename: str) -> Path | None:
+    """Lokalizuje plik zasobu w katalogu `assets/` (w trybie deweloperskim lub PyInstaller)."""
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(str(meipass)) / "assets" / filename)
+    candidates.append(Path(__file__).resolve().parent.parent.parent / "assets" / filename)
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def format_mifare_text_capacity(total_blocks: int, start_block: int, text: str) -> tuple[int, int, int, int]:
+    """Zwraca (użyte_bajty, maks_bajty, użyte_bloki, maks_bloki) dla zapisu tekstu w Mifare."""
+    blocks = writable_data_blocks(total_blocks, start_block=start_block)
+    max_blocks = len(blocks)
+    max_bytes = max_blocks * MIFARE_BLOCK_SIZE
+    used_bytes = len(text.encode("utf-8"))
+    used_blocks = (used_bytes + MIFARE_BLOCK_SIZE - 1) // MIFARE_BLOCK_SIZE if used_bytes > 0 else 0
+    return used_bytes, max_bytes, used_blocks, max_blocks
+
+
 def format_audit_status_banner(report: CardAuditReport | None) -> tuple[str, str, str]:
     """Zwraca krotkę (poziom_ryzyka, wynik_pkt, cel_migracji) dla paska statusu audytu."""
     if report is None:
@@ -376,6 +403,8 @@ class NFCPlusApp(ctk.CTk):
         self.geometry("1120x780")
         self.minsize(920, 640)
         self._mono_font = _select_monospace_font(self)
+        self._app_icon_img: tk.PhotoImage | None = None
+        self._apply_window_icon()
 
         self._devices: list[DeviceInfo] = []
         self._device_labels: list[str] = []
@@ -594,7 +623,10 @@ class NFCPlusApp(ctk.CTk):
             row=1, column=1, sticky="ew", padx=(3, 0), pady=2
         )
         ctk.CTkButton(buf_grid, text="Edytuj blok w buforze…", command=self._do_edit_mifare_block).grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(2, 2)
+            row=2, column=0, sticky="ew", padx=(0, 3), pady=(2, 2)
+        )
+        ctk.CTkButton(buf_grid, text="Zapisz tekst do bufora…", command=self._do_write_text_to_mifare_buffer).grid(
+            row=2, column=1, sticky="ew", padx=(3, 0), pady=(2, 2)
         )
         ctk.CTkButton(
             buf_grid,
@@ -1069,6 +1101,32 @@ class NFCPlusApp(ctk.CTk):
     # Pomocnicze i motyw
     # ------------------------------------------------------------------
 
+    def _apply_window_icon(self) -> None:
+        if sys.platform == "win32":
+            ico_path = _find_asset_path("nfcplus.ico")
+            if ico_path is not None:
+                ico_str = str(ico_path)
+                try:
+                    self.iconbitmap(default=ico_str)
+                except tk.TclError:
+                    pass
+                # CustomTkinter ustawia domyślną ikonę po 200 ms; nadpisujemy ją ponownie po 250 ms
+                self.after(250, lambda p=ico_str: self._set_win32_icon_safe(p))
+                return
+        png_path = _find_asset_path("nfcplus.png")
+        if png_path is not None:
+            try:
+                self._app_icon_img = tk.PhotoImage(file=str(png_path))
+                self.iconphoto(True, self._app_icon_img)
+            except tk.TclError:
+                pass
+
+    def _set_win32_icon_safe(self, ico_str: str) -> None:
+        try:
+            self.iconbitmap(default=ico_str)
+        except tk.TclError:
+            pass
+
     def _is_dark(self) -> bool:
         return self._theme == "dark"
 
@@ -1145,9 +1203,7 @@ class NFCPlusApp(ctk.CTk):
 
     def _refresh_devices(self) -> None:
         self._devices = enumerate_readers()
-        self._device_labels = [
-            f"{d.vid_pid} | {d.product or 'Czytnik HID'} ({d.path})" for d in self._devices
-        ]
+        self._device_labels = format_reader_labels(self._devices)
         self.device_combo.configure(values=self._device_labels)
         if self._device_labels:
             self.device_combo.set(self._device_labels[0])
@@ -1683,6 +1739,102 @@ class NFCPlusApp(ctk.CTk):
 
         load_selected_block()
         entry.focus_set()
+
+    def _do_write_text_to_mifare_buffer(self) -> None:
+        if self._last_mifare_dump is None:
+            messagebox.showinfo(
+                "Brak bufora",
+                "Najpierw odczytaj kartę Mifare Classic lub wczytaj plik .dump do bufora.",
+            )
+            return
+
+        dump = self._last_mifare_dump
+        win = ctk.CTkToplevel(self)
+        win.title("Zapisz tekst przez bloki Mifare Classic")
+        win.geometry("600x430")
+        win.transient(self)
+        win.grab_set()
+
+        frame = ctk.CTkFrame(win, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=14, pady=14)
+
+        start_var = tk.StringVar(value="1")
+        clear_var = tk.BooleanVar(value=False)
+        cap_var = tk.StringVar(value="")
+
+        top_row = ctk.CTkFrame(frame, fg_color="transparent")
+        top_row.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(top_row, text=f"Blok początkowy (1..{dump.total_blocks - 1}):").pack(side="left")
+        ctk.CTkEntry(top_row, textvariable=start_var, width=70).pack(side="left", padx=(6, 10))
+        ctk.CTkCheckBox(
+            top_row,
+            text="Wyczyść pozostałe bloki danych (0x00)",
+            variable=clear_var,
+        ).pack(side="left")
+
+        ctk.CTkLabel(frame, textvariable=cap_var, anchor="w").pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(
+            frame,
+            text="Tekst UTF-8 (zapisywany automatycznie z pominięciem Bloku 0 i trailerów sektorów):",
+            anchor="w",
+        ).pack(fill="x")
+
+        text_box = ctk.CTkTextbox(frame, font=(self._mono_font, 12), wrap="word")
+        text_box.pack(fill="both", expand=True, pady=(4, 10))
+
+        def load_decoded_text() -> None:
+            try:
+                sb = int(start_var.get().strip())
+                decoded = decode_blocks_to_text(dump, start_block=sb)
+            except (ValueError, IndexError) as exc:
+                messagebox.showerror("Błędny blok początkowy", str(exc), parent=win)
+                return
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", decoded)
+            update_capacity()
+
+        def update_capacity(*_: object) -> None:
+            try:
+                sb = int(start_var.get().strip())
+                txt = text_box.get("1.0", "end-1c")
+                ub, mb, ublk, mblk = format_mifare_text_capacity(dump.total_blocks, sb, txt)
+                status = "OK" if ub <= mb else "PRZEKROCZONO POJEMNOŚĆ!"
+                cap_var.set(f"Pojemność od bloku {sb}: {ub} / {mb} B ({ublk} / {mblk} bloków danych) — {status}")
+            except ValueError:
+                cap_var.set("Podaj poprawny numer bloku początkowego.")
+
+        ctk.CTkButton(top_row, text="Odczytaj z bufora", width=120, command=load_decoded_text).pack(side="right")
+        start_var.trace_add("write", update_capacity)
+        text_box.bind("<KeyRelease>", lambda _e: update_capacity())
+
+        def save_text() -> None:
+            try:
+                sb = int(start_var.get().strip())
+                txt = text_box.get("1.0", "end-1c")
+                # Wstępna walidacja pojemności przed modyfikacją bufora
+                encode_text_to_blocks(
+                    txt,
+                    dump.total_blocks,
+                    start_block=sb,
+                    clear_remaining=bool(clear_var.get()),
+                )
+                updated = dump.write_text(txt, start_block=sb, clear_remaining=bool(clear_var.get()))
+            except (ValueError, IndexError) as exc:
+                messagebox.showerror("Błąd zapisu tekstu", str(exc), parent=win)
+                return
+            for blk in updated:
+                self._last_mifare_missing.discard(blk)
+            self._refresh_mifare_preview()
+            self._log(f"Zapisano tekst ({len(txt.encode('utf-8'))} B) do {len(updated)} bloków bufora od bloku {sb}.")
+            win.destroy()
+
+        btns = ctk.CTkFrame(frame, fg_color="transparent")
+        btns.pack(fill="x")
+        ctk.CTkButton(btns, text="Zapisz tekst w buforze", command=save_text).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="Anuluj", command=win.destroy).pack(side="right")
+
+        load_decoded_text()
+        text_box.focus_set()
 
     def _do_write_mifare_dump(self) -> None:
         reader = self._require_reader()

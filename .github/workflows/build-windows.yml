@@ -10,6 +10,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -33,7 +37,17 @@ jobs:
 
       - name: Build NFCplus.exe with PyInstaller
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --collect-all customtkinter --name NFCplus --paths src src/nfcplus/app.py
+          pyinstaller --noconfirm --clean --onefile --windowed --icon assets/nfcplus.ico --add-data "assets/nfcplus.ico;assets" --add-data "assets/nfcplus.png;assets" --collect-all customtkinter --name NFCplus --paths src src/nfcplus/app.py
+
+      - name: Build NSIS Installer (NFCplus-Setup)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+            $env:PATH += ";C:\Program Files (x86)\NSIS"
+          }
+          $ver = if ($env:GITHUB_REF_NAME -like "v*") { $env:GITHUB_REF_NAME.Substring(1) } else { "0.1.0" }
+          makensis "-DVERSION=$ver" installer/nfcplus.nsi
 
       - name: Package NFCplus-Windows-x64.zip
         shell: pwsh
@@ -46,11 +60,12 @@ jobs:
           name: NFCplus-Windows-x64
           path: |
             dist/NFCplus.exe
+            dist/NFCplus-Setup-v*.exe
             NFCplus-Windows-x64.zip
           if-no-files-found: error
 
       - name: Update repository About description and topics (best-effort)
-        if: github.event_name != 'pull_request'
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,8 +96,8 @@ jobs:
           }
           EOF
 
-      - name: Publish GitHub Release (v0.1.0)
-        if: github.event_name != 'pull_request'
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -92,41 +107,33 @@ jobs:
           else
             REL_TAG="v0.1.0"
           fi
+          SETUP_EXE=$(ls dist/NFCplus-Setup-v*.exe | head -n 1)
           cat <<'EOF' > RELEASE_NOTES.md
-          ## NFCplus v0.1.0 — Klient GUI/CLI oraz Audytor Bezpieczeństwa Kart RFID/NFC (Windows & Linux)
+          ## NFCplus — Klient GUI/CLI oraz Audytor Bezpieczeństwa Kart RFID/NFC (Windows & Linux)
 
           Czytelny, działający w 100% lokalnie (offline) klient okienkowy (**CustomTkinter**, skórka **Ciemna / Jasna**) oraz narzędzie wiersza poleceń (`nfcplus`) dla czytników USB HID z rodziny **wCopy / Xixei / NFC Pro** (`0416:b030`, `0416:b031`, `2518:6022`, `2518:6018`).
 
           ### Pobieranie na Windows (x64)
-          - **`NFCplus.exe`** — samodzielny jednoplikowy program okienkowy dla Windows 10/11 x64 (nie wymaga instalacji Pythona ani dodatkowych sterowników USB).
-          - **`NFCplus-Windows-x64.zip`** — paczka zawierająca `NFCplus.exe`, skrypty pomocnicze (`run_windows.bat`, `diag_windows.bat`) oraz dokumentację `README.md`.
+          - **`NFCplus-Setup-v*.exe`** — klasyczny instalator Windows (Menu Start, Pulpit, deinstalator, ikona aplikacji).
+          - **`NFCplus.exe`** — samodzielny jednoplikowy program przenośny (portable) dla Windows 10/11 x64.
+          - **`NFCplus-Windows-x64.zip`** — paczka zawierająca `NFCplus.exe`, skrypty pomocnicze (`run_windows.bat`, `diag_windows.bat`) oraz `README.md`.
 
           ### Najważniejsze funkcje
-          1. **Natywna obsługa USB HID bez zewnętrznych sterowników:**
-             - **Windows:** wbudowany backend Win32 HID (`setupapi.dll` / `hid.dll` / `kernel32.dll` przez `ctypes`).
-             - **Linux:** wbudowany backend `/dev/hidraw*` z utwardzonymi regułami `udev` (`MODE="0660", GROUP="plugdev", TAG+="uaccess"`).
-          2. **Skanowanie jedno- i wieloczęstotliwościowe:**
-             - `13.56 MHz` (ISO 14443-A: MIFARE Classic Mini/1K/4K, Ultralight/NTAG, ISO 14443-4 CPU/DESFire) oraz `125 kHz` (`EM4100 / T5577` i `HID Prox` 26–37 bitów).
-          3. **MIFARE Classic:**
-             - odczyt i zapis sektorów/zrzutów `.dump` (z domyślną ochroną Bloku 0 oraz weryfikacją bitów dostępu `C1/C2/C3` przed wysłaniem komendy `0xA0`),
-             - bezpieczne formatowanie kart do stanu fabrycznego, siatka statusu kluczy `Key A / Key B`, import słowników `.txt/.dic`, analizator `Access Bits` i `Value Block`, eksport JSON.
-          4. **NTAG / Ultralight i NDEF:**
-             - `GET_VERSION`, autoryzacja hasłem `PWD_AUTH`, dekodowanie i zapis rekordów **NDEF** (`URI` oraz `Text`).
-          5. **125 kHz LF i T5577:**
-             - zapis identyfikatorów `EM4100` i `HID Prox` na czyste transpondery `T5577` z weryfikacją odczytem oraz dwukierunkowy konwerter formatów (`40-bit HEX` ↔ `DEC 10` ↔ `DEC 8 / WG26` ↔ `FC + CN`).
-          6. **Konsola ISO 14443-4 APDU oraz Porównywarka Zrzutów (`.dump`) obok siebie.**
-          7. **Nieinwazyjny Audyt Bezpieczeństwa Karty (`Read-Only`):**
-             - ocena ryzyka (`0–100 pkt`, `KRYTYCZNE / WYSOKIE / ŚREDNIE / NISKIE`), wykrywanie kluczy domyślnych, `Crypto1`, `Key A == Key B`, błędnych `Access Bits`, anomalii `BCC/SAK/ATQA` w Bloku 0 (wskaźnik CUID/Gen2), otwartego `Static Lock` / `AUTH0` w NTAG oraz nieszyfrowanych transponderów 125 kHz,
-             - automatyczne maskowanie kluczy (`A0A1****A4A5`) i eksport raportów do **HTML (do druku / PDF)**, **Markdown** oraz **JSON**.
+          1. **Natywna obsługa USB HID bez zewnętrznych sterowników** (Win32 HID na Windowsie, `/dev/hidraw*` + utwardzone `udev` na Linuksie).
+          2. **Skanowanie jedno- i wieloczęstotliwościowe** (`13.56 MHz` ISO 14443-A + `125 kHz` EM4100/T5577 i HID Prox).
+          3. **MIFARE Classic:** odczyt, zapis zrzutów `.dump`, zapis tekstu przez bloki danych, formatowanie, siatka kluczy `A/B`, import `.txt/.dic`, analizator `Access Bits` / `Value Block`, eksport JSON.
+          4. **NTAG / Ultralight & NDEF:** `GET_VERSION`, `PWD_AUTH`, dekodowanie i zapis rekordów NDEF (`URI` / `Text`).
+          5. **125 kHz T5577 & konwerter formatów LF**, **Konsola APDU**, **Porównywarka `.dump` obok siebie**.
+          6. **Nieinwazyjny Audyt Bezpieczeństwa Karty (`Read-Only`)** z maskowaniem kluczy i eksportem HTML/Markdown/JSON.
           EOF
 
           if gh release view "${REL_TAG}" >/dev/null 2>&1; then
-            gh release upload "${REL_TAG}" dist/NFCplus.exe NFCplus-Windows-x64.zip --clobber
+            gh release upload "${REL_TAG}" dist/NFCplus.exe "${SETUP_EXE}" NFCplus-Windows-x64.zip --clobber
             gh release edit "${REL_TAG}" \
               --title "NFCplus ${REL_TAG} — Klient i audytor NFC / Mifare (Windows & Linux)" \
               --notes-file RELEASE_NOTES.md
           else
-            gh release create "${REL_TAG}" dist/NFCplus.exe NFCplus-Windows-x64.zip \
+            gh release create "${REL_TAG}" dist/NFCplus.exe "${SETUP_EXE}" NFCplus-Windows-x64.zip \
               --title "NFCplus ${REL_TAG} — Klient i audytor NFC / Mifare (Windows & Linux)" \
               --notes-file RELEASE_NOTES.md
           fi
