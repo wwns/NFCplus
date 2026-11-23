@@ -66,7 +66,7 @@ Dla czytnika **ACS ACR122U (`072f:2200`)** obsługiwane są dwa warianty komunik
 
 Na Windowsie komunikacja z czytnikiem działa **bez dodatkowych sterowników ani pakietów USB/PC/SC**:
 - dla czytników **wCopy / Xixei / NFC Pro** wbudowany `WindowsHidTransport` korzysta bezpośrednio z Win32 API (`setupapi.dll`, `hid.dll`, `kernel32.dll` przez `ctypes`),
-- dla **ACS ACR122U (`072f:2200`)** wbudowany `WindowsPcscTransport` korzysta bezpośrednio z systemowej biblioteki `winscard.dll` (`PC/SC`) — czytnik obsługuje wyłącznie pasmo `13,56 MHz` (operacje `125 kHz` / HID Prox są automatycznie pomijane lub informują o braku cewki LF).
+- dla **ACS ACR122U (`072f:2200`)** wbudowany `WindowsPcscTransport` korzysta bezpośrednio z systemowej biblioteki `winscard.dll` (`PC/SC`) — czytnik obsługuje wyłącznie pasmo `13,56 MHz` (operacje `125 kHz` / HID Prox są automatycznie pomijane lub informują o braku cewki LF). Instalator Windows **`NFCplus-Setup-v*.exe`** zawiera i automatycznie instaluje oficjalny sterownik **ACS Unified PC/SC Driver 4.2.8.0** (`acsdrv.inf`), dzięki czemu od razu działają także komendy `IOCTL_CCID_ESCAPE`, sygnał `Beep` bez karty na czytniku oraz odczyt wersji firmware.
 
 Jedyną wymaganą zależnością interfejsu graficznego jest `customtkinter>=5.2` (instalowana automatycznie przez `pip install -e .` lub skrypt `run_windows.bat`).
 

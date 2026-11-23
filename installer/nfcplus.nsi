@@ -86,14 +86,41 @@ Section "Skrót na Pulpicie" SecDesktop
   CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\assets\nfcplus.ico" 0
 SectionEnd
 
+Section "Sterownik ACS ACR122U (PC/SC 4.2.8.0)" SecDriver
+  SetOutPath "$INSTDIR\drivers\acs"
+  File "..\ACS Unified PCSC Driver 4.2.8.0\*.*"
+  DetailPrint "Instalowanie sterownika ACS Unified PC/SC 4.2.8.0..."
+
+  ${If} ${RunningX64}
+    ExecWait '"$WINDIR\Sysnative\pnputil.exe" /add-driver "$INSTDIR\drivers\acs\acsdrv.inf" /install' $0
+  ${Else}
+    ExecWait '"$SYSDIR\pnputil.exe" /add-driver "$INSTDIR\drivers\acs\acsdrv.inf" /install' $0
+  ${EndIf}
+
+  ${If} $0 == 0
+    DetailPrint "Sterownik ACS ACR122U zainstalowany pomyślnie."
+  ${ElseIf} $0 == 259
+    DetailPrint "Sterownik ACS ACR122U jest już aktualny lub gotowy po podpięciu czytnika."
+  ${ElseIf} $0 == 3010
+    DetailPrint "Sterownik ACS ACR122U zainstalowany (zalecany restart systemu Windows)."
+  ${Else}
+    DetailPrint "pnputil zakończył się kodem $0 (pliki sterownika zapisano w $INSTDIR\drivers\acs)."
+  ${EndIf}
+
+  SetOutPath "$INSTDIR"
+SectionEnd
+
 LangString DESC_SecMain ${LANG_POLISH} "Główne pliki programu NFCplus, dokumentacja oraz skrypty diagnostyczne."
 LangString DESC_SecMain ${LANG_ENGLISH} "Core NFCplus application, documentation, and diagnostic scripts."
 LangString DESC_SecDesktop ${LANG_POLISH} "Tworzy skrót NFCplus na Pulpicie."
 LangString DESC_SecDesktop ${LANG_ENGLISH} "Creates an NFCplus shortcut on the Desktop."
+LangString DESC_SecDriver ${LANG_POLISH} "Instaluje oficjalny sterownik ACS Unified PC/SC 4.2.8.0 dla czytnika ACR122U (pełna obsługa IOCTL_CCID_ESCAPE, Beep bez karty oraz odczyt firmware)."
+LangString DESC_SecDriver ${LANG_ENGLISH} "Installs the official ACS Unified PC/SC 4.2.8.0 driver for ACR122U (enables IOCTL_CCID_ESCAPE, cardless Beep, and firmware info)."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} $(DESC_SecMain)
   !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} $(DESC_SecDesktop)
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecDriver} $(DESC_SecDriver)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
@@ -111,6 +138,7 @@ Section "Uninstall"
   Delete "$INSTDIR\Uninstall.exe"
   Delete "$INSTDIR\assets\nfcplus.ico"
   RMDir "$INSTDIR\assets"
+  RMDir /r "$INSTDIR\drivers"
   RMDir "$INSTDIR"
 
   DeleteRegKey HKLM "${UNINST_KEY}"
