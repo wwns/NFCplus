@@ -684,23 +684,27 @@ class NFCReader:
 
     def beep(self, duration_ms: int = 50) -> None:
         """Uruchamia brzęczyk czytnika na podany czas (w ms)."""
-        dur = max(1, (duration_ms // 10) & 0xFF)
         if self.is_acr122u:
-            if self._pcsc_fallback:
-                return
+            # W ACR122U parametr T1 w FF 00 40 00 04 <T1> ... ma jednostkę 100 ms.
+            dur = max(1, min(0xFF, (duration_ms + 99) // 100))
             try:
                 resp = self._transport.apdu_exchange(
                     bytes([0xFF, 0x00, 0x40, 0x00, 0x04, dur, 0x00, 0x01, 0x01]),
                     timeout_ms=self._timeout_ms,
                 )
             except (TransportError, ProtocolError) as exc:
-                if _is_pcsc_escape_blocked(exc):
-                    self._pcsc_fallback = True
-                return
+                if isinstance(exc, NoSmartCardError) or _is_pcsc_escape_blocked(exc):
+                    raise ProtocolError(
+                        "Brzęczyk ACR122U wymaga położenia karty na czytniku albo zainstalowania "
+                        "sterownika ACS ACR122U (wbudowany sterownik Windows Usbccid blokuje "
+                        "IOCTL_CCID_ESCAPE bez karty)."
+                    ) from exc
+                raise
             # ACR122U zwraca 90 <LED_STATE> (bit 0 = czerwony, bit 1 = zielony), np. 90 00..90 03.
             if len(resp) < 2 or resp[-2] != 0x90:
                 raise ProtocolError(f"Błąd brzęczyka ACR122U: {resp.hex(' ')}")
             return
+        dur = max(1, (duration_ms // 10) & 0xFF)
         self.exchange_raw(bytes([0xFF, 0x00, 0x40, 0x50, 0x04, dur, 0x01, 0x01, 0x01]))
 
     # ------------------------------------------------------------------

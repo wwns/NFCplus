@@ -1065,6 +1065,8 @@ _SCARD_E_NO_SMARTCARD = 0x8010000C
 _SCARD_W_RESET_CARD = 0x80100068
 _SCARD_W_REMOVED_CARD = 0x80100069
 _SCARD_NO_CARD_ERRORS = (_SCARD_E_NO_SMARTCARD, _SCARD_W_REMOVED_CARD)
+_CM_IOCTL_GET_FEATURE_REQUEST = 0x00313520
+_FEATURE_CCID_ESC_COMMAND = 0x13
 _IOCTL_CCID_ESCAPE_WIN = 0x003136B0
 _IOCTL_CCID_ESCAPE_LINUX = 0x42000DAC
 _IOCTL_CCID_ALT_LINUX = 0x42000D48
@@ -1152,6 +1154,8 @@ class WindowsPcscTransport(_BasePcscTransport):
     def __init__(self, reader_name: str, *, dll: Any | None = None) -> None:
         super().__init__(reader_name)
         self._dll = dll
+        self._escape_ioctl: int = _IOCTL_CCID_ESCAPE_WIN
+        self._escape_ioctl_probed: bool = False
 
     def _api(self) -> Any:
         if self._dll is None:
@@ -1227,6 +1231,8 @@ class WindowsPcscTransport(_BasePcscTransport):
             self._card = None
             self._ctx = None
             self._active_protocol = 0
+            self._escape_ioctl = _IOCTL_CCID_ESCAPE_WIN
+            self._escape_ioctl_probed = False
 
     def get_atr(self) -> bytes | None:
         if self._card is None:
@@ -1323,6 +1329,44 @@ class WindowsPcscTransport(_BasePcscTransport):
             raise NoSmartCardError("Brak karty lub tagu na czytniku ACR122U.")
         raise TransportError(f"SCardReconnect/SCardConnectW(SHARED) nie powiodło się (0x{rc_u32:08X}).")
 
+    def _resolve_escape_ioctl(self, api: Any) -> int:
+        """Odpytuje CM_IOCTL_GET_FEATURE_REQUEST (0x00313520) o FEATURE_CCID_ESC_COMMAND (0x13)."""
+        if self._escape_ioctl_probed:
+            return self._escape_ioctl
+        self._escape_ioctl_probed = True
+        recv_buf = (ctypes.c_ubyte * 256)()
+        recv_len = ctypes.c_uint32(256)
+        try:
+            rc = int(
+                api.SCardControl(
+                    self._card,
+                    _CM_IOCTL_GET_FEATURE_REQUEST,
+                    None,
+                    0,
+                    recv_buf,
+                    len(recv_buf),
+                    ctypes.byref(recv_len),
+                )
+            )
+        except Exception:
+            return self._escape_ioctl
+        if rc != 0:
+            return self._escape_ioctl
+        raw = bytes(recv_buf[: int(recv_len.value)])
+        idx = 0
+        while idx + 2 <= len(raw):
+            tag = raw[idx]
+            length = raw[idx + 1]
+            if idx + 2 + length > len(raw):
+                break
+            if tag == _FEATURE_CCID_ESC_COMMAND and length == 4:
+                ioctl = int.from_bytes(raw[idx + 2 : idx + 6], "big")
+                if ioctl != 0:
+                    self._escape_ioctl = ioctl
+                break
+            idx += 2 + length
+        return self._escape_ioctl
+
     def apdu_exchange(self, apdu: bytes, timeout_ms: int = 2000) -> bytes:
         if self._card is None:
             raise TransportError("Czytnik ACR122U (PC/SC) nie jest otwarty.")
@@ -1332,10 +1376,11 @@ class WindowsPcscTransport(_BasePcscTransport):
         recv_len = ctypes.c_uint32(512)
 
         if self._active_protocol == 0 or apdu[:2] == b"\xff\x00":
+            escape_ioctl = self._resolve_escape_ioctl(api)
             rc = int(
                 api.SCardControl(
                     self._card,
-                    _IOCTL_CCID_ESCAPE_WIN,
+                    escape_ioctl,
                     send_buf,
                     len(apdu),
                     recv_buf,
@@ -1346,10 +1391,7 @@ class WindowsPcscTransport(_BasePcscTransport):
             if rc == 0:
                 return bytes(recv_buf[: int(recv_len.value)])
             if self._active_protocol == 0:
-                if apdu[:2] != b"\xff\x00":
-                    self._reconnect_shared(api)
-                else:
-                    raise TransportError(f"SCardControl(ACR122U) nie powiodło się (0x{rc & 0xFFFFFFFF:08X}).")
+                self._reconnect_shared(api)
 
         class _SCardIoRequest(ctypes.Structure):
             _fields_ = [("dwProtocol", ctypes.c_uint32), ("cbPciLength", ctypes.c_uint32)]

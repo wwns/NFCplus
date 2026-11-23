@@ -118,6 +118,7 @@ def test_windows_pcsc_transport_direct_control_and_cleanup() -> None:
     assert calls == [
         "establish",
         "connect:ACS ACR122U PICC Interface 0:2:3",
+        "control:0x00313520:0",
         "control:0x003136b0:5",
         "disconnect",
         "release",
@@ -223,7 +224,7 @@ def test_nfc_reader_acr122u_ops_and_lf_rejection() -> None:
     assert info["model"] == "ACS ACR122U PICC Interface"
     reader.beep(50)
     assert t.sent_apdus[0] == bytes.fromhex("FF00480000")
-    assert t.sent_apdus[1] == bytes.fromhex("FF0040000405000101")
+    assert t.sent_apdus[1] == bytes.fromhex("FF0040000401000101")
 
     card = reader.scan_card(init_rf=False)
     assert card is not None and card.uid == uid and card.sak == 0x08
@@ -350,19 +351,21 @@ def test_windows_pcsc_transport_escape_blocked_reconnect_and_sharing_violation()
     t = WindowsPcscTransport("ACS ACR122U PICC Interface 0", dll=FakeWinscardFallback())
     with t:
         assert t.pcsc_card_present is False
-        # Escape FF 00 ... przy EscapeCommandEnable=0 rzuca TransportError
-        with pytest.raises(TransportError, match="0x00000001"):
+        # Escape FF 00 ... przy EscapeCommandEnable=0 i braku karty próbuje _reconnect_shared -> NoSmartCardError
+        with pytest.raises(NoSmartCardError):
             t.apdu_exchange(b"\xff\x00\x48\x00\x00")
         # Standardowe APDU bez karty na czytniku rzuca NoSmartCardError i utrzymuje otwarty transport
         with pytest.raises(NoSmartCardError):
             t.apdu_exchange(b"\xff\xca\x00\x00\x00")
         assert t.is_open is True
 
-        # Po przyłożeniu karty reconnect w SHARED + SCardTransmit działa
+        # Po przyłożeniu karty reconnect w SHARED + SCardTransmit działa (również dla FF 00 40 beep)
         state["card_present"] = True
         resp = t.apdu_exchange(b"\xff\xca\x00\x00\x00")
         assert resp == b"\xde\xad\xbe\xef\x90\x00"
         assert t.pcsc_card_present is True
+        beep_resp = t.apdu_exchange(b"\xff\x00\x40\x00\x04\x01\x00\x01\x01")
+        assert beep_resp == b"\xde\xad\xbe\xef\x90\x00"
         atr = t.get_atr()
         assert atr is not None and atr.startswith(b"\x3b\x8f")
 
@@ -434,7 +437,8 @@ def test_nfc_reader_acr122u_pcsc_fallback_when_escape_blocked() -> None:
 
     info = reader.get_device_info()
     assert info["firmware"] == "ACS ACR122U (PC/SC)"
-    reader.beep(50)
+    with pytest.raises(ProtocolError, match="Brzęczyk ACR122U wymaga położenia karty"):
+        reader.beep(50)
 
     card = reader.scan_card()
     assert card is not None
@@ -450,7 +454,7 @@ def test_nfc_reader_acr122u_pcsc_fallback_when_escape_blocked() -> None:
     assert reader.ntag_read_page(4) == b"NDEF"
     reader.ntag_write_page(4, b"TEST")
 
-    assert t.sent[1:] == [
+    assert t.sent[2:] == [
         bytes.fromhex("FFCA000000"),
         bytes.fromhex("FF82000006FFFFFFFFFFFF"),
         bytes.fromhex("FF860000050100046000"),
@@ -460,3 +464,93 @@ def test_nfc_reader_acr122u_pcsc_fallback_when_escape_blocked() -> None:
         bytes.fromhex("FFB0000404"),
         bytes.fromhex("FFD6000404") + b"TEST",
     ]
+
+
+def test_windows_pcsc_transport_get_feature_request_ioctl_and_beep_after_fallback() -> None:
+    used_ioctls: list[int] = []
+
+    class FakeWinscardFeatures:
+        def SCardEstablishContext(self, _scope, _r1, _r2, ctx_out) -> int:
+            ctx_out._obj.value = 0x1001
+            return 0
+
+        def SCardConnectW(self, _ctx, _name, _share, _pref, card_out, proto_out) -> int:
+            card_out._obj.value = 0x2001
+            proto_out._obj.value = 0
+            return 0
+
+        def SCardControl(self, _card, ioctl, _in_buf, _in_len, out_buf, _out_len, ret_len) -> int:
+            used_ioctls.append(ioctl)
+            if ioctl == 0x00313520:  # CM_IOCTL_GET_FEATURE_REQUEST
+                # TLV: FEATURE_CCID_ESC_COMMAND (0x13), len=4, IOCTL=0x00312000 (big-endian)
+                tlv = bytes.fromhex("120400313520130400312000")
+                for i, b in enumerate(tlv):
+                    out_buf[i] = b
+                ret_len._obj.value = len(tlv)
+                return 0
+            if ioctl == 0x00312000:
+                reply = b"\x90\x02"
+                for i, b in enumerate(reply):
+                    out_buf[i] = b
+                ret_len._obj.value = len(reply)
+                return 0
+            return 0x00000001
+
+        def SCardDisconnect(self, _card, _disp) -> int:
+            return 0
+
+        def SCardReleaseContext(self, _ctx) -> int:
+            return 0
+
+    t = WindowsPcscTransport("ACS ACR122U PICC Interface 0", dll=FakeWinscardFeatures())
+    with t:
+        assert t.apdu_exchange(b"\xff\x00\x40\x00\x04\x01\x00\x01\x01") == b"\x90\x02"
+    assert used_ioctls == [0x00313520, 0x00312000]
+
+    # Gdy get_firmware_version ustawił _pcsc_fallback=True, a karta jest obecna, beep nadal działa przez SCardTransmit
+    class BeepFallbackTransport(HIDTransport):
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        @property
+        def product(self) -> str:
+            return "ACS ACR122U PICC Interface 0"
+
+        @property
+        def protocol_family(self) -> str:
+            return "acr122u"
+
+        @property
+        def supports_lf(self) -> bool:
+            return False
+
+        @property
+        def is_open(self) -> bool:
+            return True
+
+        def open(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+        def read(self, size: int = 64, timeout_ms: int = 2000) -> bytes:
+            return b""
+
+        def apdu_exchange(self, apdu: bytes, timeout_ms: int = 2000) -> bytes:
+            self.sent.append(apdu)
+            if apdu == b"\xff\x00\x48\x00\x00":
+                raise TransportError("SCardControl(ACR122U) nie powiodło się (0x00000001).")
+            if apdu[:4] == b"\xff\x00\x40\x00":
+                return b"\x90\x02"
+            return b"\x90\x00"
+
+    bt = BeepFallbackTransport()
+    reader = NFCReader(bt)
+    assert reader.get_device_info()["firmware"] == "ACS ACR122U (PC/SC)"
+    assert reader._pcsc_fallback is True
+    reader.beep(150)
+    assert bt.sent[-1] == bytes.fromhex("FF0040000402000101")
