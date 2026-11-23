@@ -1,4 +1,4 @@
-; NFCplus Windows Installer (NSIS MUI2)
+﻿; NFCplus Windows Installer (NSIS MUI2)
 Unicode True
 
 !ifndef VERSION
